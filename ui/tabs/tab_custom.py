@@ -42,34 +42,29 @@ class CustomTab(BaseTab):
     def build(self):
         f = self.form
 
-        bar = ttk.Frame(self.form_holder, style="Panel.TFrame")
-        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+        # 所有行都通过 form 分配行号，不要手工 grid(row=N) ——
+        # 否则很容易和 section 抢同一行，控件会叠在一起。
+        bar = f.full_row(pady=(4, 6))
         ttk.Label(bar, text="插入：", style="Form.TLabel").pack(side="left")
         ttk.Button(bar, text="{input}", width=8,
                    command=lambda: self._insert("{input}")).pack(side="left", padx=(2, 4))
         ttk.Button(bar, text="{output}", width=9,
                    command=lambda: self._insert("{output}")).pack(side="left", padx=(0, 12))
         ttk.Button(bar, text="重置模板", width=10, command=self._reset).pack(side="left")
-        f.row += 1
 
-        holder = ttk.Frame(self.form_holder, style="Panel.TFrame")
-        holder.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
-        holder.columnconfigure(0, weight=1)
-        self.form_holder.rowconfigure(1, weight=1)
-
+        holder = f.full_row(pady=(0, 10), stretch=True)
         self.text = tk.Text(holder, height=7, wrap="word", bg="#fbfbfc", fg="#1f2329",
                             relief="solid", borderwidth=1, font=("Consolas", 10), padx=10, pady=8,
                             insertbackground="#1f2329")
         self.text.grid(row=0, column=0, sticky="nsew")
         vsb = ttk.Scrollbar(holder, orient="vertical", command=self.text.yview)
         vsb.grid(row=0, column=1, sticky="ns")
+        holder.rowconfigure(0, weight=1)
         self.text.configure(yscrollcommand=vsb.set)
         self.text.insert("1.0", TEMPLATE)
 
         f.section("常用参数片段（点击插入到尾部）")
-        frag = ttk.Frame(self.form_holder, style="Panel.TFrame")
-        frag.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-        f.row += 1
+        frag = f.full_row(pady=(0, 10))
         col = 0
         row_i = 0
         for label, snippet in SNIPPETS:

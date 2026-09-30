@@ -75,9 +75,8 @@ class CompressTab(BaseTab):
 
         f.combo("压缩策略", self.strategy, STRATEGIES, width=26, on_change=self._on_strategy)
 
-        self.crf_scale = f.scale("CRF 画质", self.crf, 0, 51, on_change=self._on_crf, width=320)
-        self.crf_hint = ttk.Label(self.form_holder, text="", style="PanelMuted.TLabel")
-        self.crf_hint.grid(row=self.form.row - 1, column=1, sticky="e")
+        self.crf_scale = f.scale("CRF 画质", self.crf, 0, 51, on_change=self._on_crf,
+                                 width=320, extra=self._add_crf_hint)
         self.crf.trace_add("write", lambda *a: self._update_hint())
 
         self.br_entry = f.entry("视频码率", self.vbitrate, width=12)
@@ -120,6 +119,11 @@ class CompressTab(BaseTab):
     # ------------------------------------------------------------------
     def _mb_extra(self, parent, col):
         ttk.Label(parent, text="MB", style="PanelMuted.TLabel").grid(row=0, column=col, padx=(6, 0))
+
+    def _add_crf_hint(self, holder, col):
+        """把 CRF 说明文字放进滑块所在容器，避免和同行控件叠在一起。"""
+        self.crf_hint = ttk.Label(holder, text="", style="PanelMuted.TLabel")
+        self.crf_hint.grid(row=0, column=col, padx=(14, 0))
 
     def _on_strategy(self):
         s = self.strategy.get()

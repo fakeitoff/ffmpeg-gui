@@ -276,26 +276,36 @@ TEMP_PREFIXES = ("ffgui_concat_", "ffgui_drawtext_", "ffgui_test_")
 _TEMP_LEGACY_RE = re.compile(r"^ffgui_[0-9a-z_]{8}\.txt$")
 
 
+_local_temp_cache: str | None = None
+
+
 def local_temp_dir() -> str:
     """返回本程序专用的临时目录：``<程序根目录>/temp``。
 
     放在程序自己的目录下，位置直观、方便用户随时手动清空；
     若程序目录不可写（例如装在 Program Files），自动退回系统临时目录。
+    结果按进程缓存，避免每次生成命令都去做一次写权限探测。
     """
+    global _local_temp_cache
+    if _local_temp_cache:
+        return _local_temp_cache
+
     preferred = os.path.join(APP_ROOT, "temp")
     try:
         os.makedirs(preferred, exist_ok=True)
-        probe = os.path.join(preferred, ".writable")
-        with open(probe, "w", encoding="utf-8") as fh:
-            fh.write("ok")
+        import tempfile as _tf
+
+        fd, probe = _tf.mkstemp(dir=preferred, prefix=".probe_")
+        os.close(fd)
         os.remove(probe)
-        return preferred
+        _local_temp_cache = preferred
     except OSError:
         import tempfile
 
         fallback = os.path.join(tempfile.gettempdir(), "ffmpeg-gui")
         os.makedirs(fallback, exist_ok=True)
-        return fallback
+        _local_temp_cache = fallback
+    return _local_temp_cache
 
 
 def purge_dir(directory: str, max_age_hours: float = 0.0,

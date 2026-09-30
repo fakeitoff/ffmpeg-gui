@@ -44,6 +44,21 @@ class Form:
         f.columnconfigure(0, weight=1)
         return f
 
+    def full_row(self, pady=0, stretch: bool = False) -> ttk.Frame:
+        """占用整整一行（横跨两列），返回容器；用于放自定义控件。
+
+        ``stretch=True`` 时该行会跟随窗口纵向拉伸。
+        统一走这里分配行号，避免手工 +1 导致控件叠在同一格里。
+        """
+        row = self.row
+        self.row += 1
+        holder = ttk.Frame(self.parent, style="Panel.TFrame")
+        holder.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=pady)
+        holder.columnconfigure(0, weight=1)
+        if stretch:
+            self.parent.rowconfigure(row, weight=1)
+        return holder
+
     def section(self, title: str):
         row = self.row
         self.row += 1
@@ -105,7 +120,8 @@ class Form:
         return cb
 
     def scale(self, label: str, var: tk.IntVar, from_=0, to=51,
-              on_change=None, width: int = 300, show_value: bool = True, unit: str = ""):
+              on_change=None, width: int = 300, show_value: bool = True, unit: str = "",
+              extra=None):
         f = self.field(label)
         holder = ttk.Frame(f, style="Panel.TFrame")
         holder.grid(row=0, column=0, sticky="ew")
@@ -113,15 +129,21 @@ class Form:
         s = ttk.Scale(holder, from_=from_, to=to, variable=var, orient="horizontal",
                       command=lambda v: (on_change() if on_change else None))
         s.grid(row=0, column=0, sticky="ew")
+        col = 1
         if show_value:
             val = ttk.Label(holder, textvariable=var, style="Form.TLabel", width=4, anchor="e")
-            val.grid(row=0, column=1, padx=(8, 0))
+            val.grid(row=0, column=col, padx=(8, 0))
+            col += 1
             if unit:
-                ttk.Label(holder, text=unit, style="PanelMuted.TLabel").grid(row=0, column=2, padx=(2, 0))
+                ttk.Label(holder, text=unit, style="PanelMuted.TLabel").grid(
+                    row=0, column=col, padx=(2, 0))
+                col += 1
+        if extra:
+            extra(holder, col)
         return s
 
     def fscale(self, label: str, var: tk.DoubleVar, from_, to, on_change=None,
-               width: int = 300, fmt: str = "{:.2f}", unit: str = ""):
+               width: int = 300, fmt: str = "{:.2f}", unit: str = "", extra=None):
         """浮点滑块（用于亮度/对比度等连续参数）。"""
         f = self.field(label)
         holder = ttk.Frame(f, style="Panel.TFrame")
@@ -141,8 +163,12 @@ class Form:
                         width=7, anchor="e")
         lbl.grid(row=0, column=1, padx=(8, 0))
         var.trace_add("write", show)
+        col = 2
         if unit:
-            ttk.Label(holder, text=unit, style="PanelMuted.TLabel").grid(row=0, column=2, padx=(2, 0))
+            ttk.Label(holder, text=unit, style="PanelMuted.TLabel").grid(row=0, column=col, padx=(2, 0))
+            col += 1
+        if extra:
+            extra(holder, col)
         return s
 
     def radios(self, label: str, var: tk.StringVar, options, on_change=None):

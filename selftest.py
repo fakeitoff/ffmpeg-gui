@@ -50,6 +50,14 @@ def make_samples(ffmpeg: str, folder: str):
 
 
 def main():
+    # 自检过程中屏蔽所有弹窗，避免无人值守时卡住
+    import tkinter.messagebox as _mb
+
+    _mb.showwarning = lambda *a, **k: None
+    _mb.showerror = lambda *a, **k: None
+    _mb.showinfo = lambda *a, **k: None
+    _mb.askyesno = lambda *a, **k: True
+
     try:
         ffmpeg, ffprobe = locate()
     except Exception as exc:  # noqa: BLE001
@@ -232,12 +240,19 @@ def main():
     e._on_operation()
     e.wm_text.set("中文水印: 100% 'ok' [测试]\n第二行")
     cmd_e = " ".join(e.build_cmd(a, probe_dst))
-    check("文字水印直接内联，不产生文本文件",
-          "text='" in cmd_e and "textfile=" not in cmd_e
-          and not glob.glob(os.path.join(local_temp, "*draw*")),
-          cmd_e[cmd_e.find("drawtext"):cmd_e.find("drawtext") + 110])
-    check("多行水印展开为多条 drawtext", cmd_e.count("drawtext=") == 2,
-          f"{cmd_e.count('drawtext=')} 条")
+    wm_files = e.aux_files()
+    check("文字水印走 textfile，彻底规避转义问题",
+          "textfile='" in cmd_e and ":text='" not in cmd_e,
+          cmd_e[cmd_e.find("drawtext"):cmd_e.find("drawtext") + 100])
+    check("多行水印 = 每行一个文本文件，且都不含换行",
+          len(wm_files) == 2 and all(os.path.exists(p) for p in wm_files)
+          and all("\n" not in open(p, encoding="utf-8").read() for p in wm_files),
+          f"{len(wm_files)} 个文件")
+    check("水印文本原样写入（引号/方括号/冒号/百分号不变形）",
+          open(wm_files[0], encoding="utf-8").read() == "中文水印: 100% 'ok' [测试]",
+          open(wm_files[0], encoding="utf-8").read())
+    e.cleanup()
+    check("cleanup 后水印文本文件已删除", not any(os.path.exists(p) for p in wm_files))
 
     # 合并结果校验
     try:
@@ -311,7 +326,99 @@ def main():
     check("媒体信息页输出", "分辨率" in content and "编码" in content,
           content.splitlines()[1] if content.splitlines() else "")
 
-    app.destroy()
+    # ---- 12. 执行流程与界面状态 ----
+    # 回归点：JobRunner 曾把停止信号命名为 self._stop，覆盖了
+    # threading.Thread._stop()，导致线程结束后 is_alive() 抛 TypeError，
+    # 表现为「命令行预览一直停在『正在执行…』」且窗口关不掉。
+    import time as _time
+
+    def pump(seconds):
+        end = _time.time() + seconds
+        while _time.time() < end:
+            app.update()
+            _time.sleep(0.02)
+
+    app.notebook.select(1)              # 压缩 / 画质（会真实重新编码）
+    app._on_tab_changed()
+    # 把任务调得慢一些，保证「执行中」状态能被预览轮询稳定观察到
+    ct = app.tabs[1]
+    ct.strategy.set("均衡（CRF 23，推荐）")
+    ct._on_strategy()
+    ct.preset.set("slow")
+    ct.resolution.set("1920 × 1080  (1080p)")
+    ct._on_resolution()
+    pump(0.6)
+    check("runner 状态查询不抛异常", app._runner_busy() in (True, False))
+
+    def run_cycle(tag):
+        app.on_start()
+        seen_running = False
+        deadline = _time.time() + 90
+        while _time.time() < deadline:
+            pump(0.15)
+            if app._last_preview.startswith("正在执行"):
+                seen_running = True
+            if app.runner.results:
+                break
+        pump(0.4)
+
+        def preview_back():
+            pv = app._last_preview
+            return bool(pv) and "ffmpeg" in pv.lower() and not pv.startswith("正在")
+
+        recovery = _time.time() + 6
+        while _time.time() < recovery and not preview_back():
+            pump(0.15)
+
+        all_ok = bool(app.runner.results) and all(r[1] for r in app.runner.results)
+        check(f"第 {tag} 次执行：过程中显示「正在执行」", seen_running)
+        check(f"第 {tag} 次执行：任务全部成功（{len(app.runner.results)} 个）", all_ok)
+        check(f"第 {tag} 次执行：runner 已结束", app._runner_busy() is False)
+        check(f"第 {tag} 次执行：预览恢复为真实命令行", preview_back(),
+              app._last_preview[:64])
+        check(f"第 {tag} 次执行：开始按钮恢复可用",
+              str(app.btn_start.cget("state")) == "normal")
+
+    run_cycle(1)
+    run_cycle(2)
+
+    # ---- 13. 布局检查：同一格子（列区间相交）里不能有两个控件 ----
+    # 回归点：自定义命令页曾手工推算 grid 行号，导致「常用参数片段」按钮网格
+    # 与「输出」标题叠在同一行，界面被切断。
+    def layout_overlaps():
+        bad = []
+        for tab in app.tabs:
+            holder = getattr(tab, "form_holder", None)
+            if holder is None:
+                continue
+            rows: dict[int, list] = {}
+            for child in holder.winfo_children():
+                info = child.grid_info()
+                if not info:
+                    continue
+                row = int(info.get("row", 0))
+                col = int(info.get("column", 0))
+                span = max(1, int(info.get("columnspan", 1)))
+                rows.setdefault(row, []).append((col, col + span - 1, child.winfo_class()))
+            for row, items in rows.items():
+                for i in range(len(items)):
+                    for j in range(i + 1, len(items)):
+                        a, b = items[i], items[j]
+                        if a[0] <= b[1] and b[0] <= a[1]:
+                            bad.append(f"{tab.name} 第{row}行 {a[2]}与{b[2]}")
+        return bad
+
+    overlaps = layout_overlaps()
+    check("各功能页布局无控件重叠", not overlaps,
+          "; ".join(overlaps[:3]) if overlaps else f"{len(app.tabs)} 个页面全部正常")
+
+    # ---- 14. 关闭窗口（内部会 destroy，之后不再使用 app）----
+    close_error = ""
+    try:
+        app._on_close()
+    except Exception as exc:  # noqa: BLE001
+        close_error = str(exc)
+    check("窗口可正常关闭（含关闭时的临时文件清理）", not close_error, close_error)
 
     # ---- 清理测试残留 ----
     import shutil

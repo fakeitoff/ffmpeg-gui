@@ -81,9 +81,8 @@ class ConvertTab(BaseTab):
         self.aenc_cb = f.combo("音频编码", self.aenc, ["aac"], width=34)
 
         f.section("画质与速度")
-        self.crf_scale = f.scale("视频质量", self.crf, 0, 51, on_change=self._on_crf, width=320)
-        self.crf_hint = ttk.Label(self.form_holder, text="", style="PanelMuted.TLabel")
-        self.crf_hint.grid(row=self.form.row - 1, column=1, sticky="e")
+        self.crf_scale = f.scale("视频质量", self.crf, 0, 51, on_change=self._on_crf,
+                                 width=320, extra=self._add_crf_hint)
         self.crf.trace_add("write", lambda *a: self._update_crf_hint())
 
         self.preset_cb = f.combo("编码速度", self.preset, builder.PRESETS, width=18)
@@ -103,6 +102,11 @@ class ConvertTab(BaseTab):
     def _gif_extra(self, parent, col):
         ttk.Label(parent, text="宽  ", style="PanelMuted.TLabel").grid(row=0, column=col)
         ttk.Entry(parent, textvariable=self.gif_width, width=8).grid(row=0, column=col + 1, padx=(4, 0))
+
+    def _add_crf_hint(self, holder, col):
+        """把 CRF 说明文字放进滑块所在容器，避免和同行控件叠在一起。"""
+        self.crf_hint = ttk.Label(holder, text="", style="PanelMuted.TLabel")
+        self.crf_hint.grid(row=0, column=col, padx=(14, 0))
 
     def _on_kind(self):
         values = VIDEO_FORMATS if self.kind.get() == "video" else AUDIO_FORMATS

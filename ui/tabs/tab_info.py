@@ -20,19 +20,13 @@ class InfoTab(BaseTab):
     def build(self):
         f = self.form
 
-        bar = ttk.Frame(self.form_holder, style="Panel.TFrame")
-        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(4, 8))
+        bar = f.full_row(pady=(4, 8))
         ttk.Button(bar, text="刷新", command=self.on_src_changed, width=8).pack(side="left")
         ttk.Button(bar, text="复制全部", command=self._copy, width=10).pack(side="left", padx=6)
         ttk.Button(bar, text="导出为 TXT…", command=self._export_txt, width=14).pack(side="left")
         ttk.Button(bar, text="导出为 JSON…", command=self._export_json, width=14).pack(side="left", padx=6)
-        f.row += 1
 
-        holder = ttk.Frame(self.form_holder, style="Panel.TFrame")
-        holder.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 10))
-        holder.columnconfigure(0, weight=1)
-        self.form_holder.rowconfigure(1, weight=1)
-
+        holder = f.full_row(pady=(0, 10), stretch=True)
         self.text = tk.Text(holder, height=24, wrap="none", bg="#fbfbfc", fg="#1f2329",
                             relief="solid", borderwidth=1, font=("Consolas", 10), padx=10, pady=8)
         self.text.grid(row=0, column=0, sticky="nsew")
@@ -40,6 +34,7 @@ class InfoTab(BaseTab):
         vsb.grid(row=0, column=1, sticky="ns")
         hsb = ttk.Scrollbar(holder, orient="horizontal", command=self.text.xview)
         hsb.grid(row=1, column=0, sticky="ew")
+        holder.rowconfigure(0, weight=1)
         self.text.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.text.tag_configure("head", foreground="#2563eb", font=("Consolas", 10, "bold"))
         self.text.tag_configure("key", foreground="#6b7280")

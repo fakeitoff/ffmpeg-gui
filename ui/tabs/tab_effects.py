@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from core import builder
-from core.util import escape_filter_path
+from core.util import escape_filter_path, local_temp_dir
 from .. import widgets
 from .base import BaseTab
 from .subform import SubForm as _SubForm
@@ -37,6 +37,8 @@ class EffectsTab(BaseTab):
 
     # ------------------------------------------------------------------
     def build(self):
+        self._aux_files: list[str] = []
+        self._text_cache: dict[int, str] = {}
         f = self.form
 
         self.operation = tk.StringVar(value=OP_LABEL["none"])
@@ -197,6 +199,38 @@ class EffectsTab(BaseTab):
     def output_ext(self) -> str:
         return self.app.src_ext() or "mp4"
 
+    def aux_files(self) -> list[str]:
+        return list(self._aux_files)
+
+    def cleanup(self):
+        for path in self._aux_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._aux_files = []
+        self._text_cache.clear()
+
+    def _text_files(self, text: str) -> list[str]:
+        """把水印文字按行写成文本文件，返回路径列表。
+
+        ffmpeg 的 drawtext 用 textfile 读取文本可以完全绕开转义问题；
+        但文件里若有换行符，ffmpeg 会把换行本身画成一个方块，
+        所以这里**一行一个文件**。文件放在程序目录的 temp/ 下，运行结束即删。
+        """
+        lines = str(text).splitlines() or [""]
+        folder = local_temp_dir()
+        paths = []
+        for i, line in enumerate(lines):
+            path = os.path.join(folder, f"watermark_{os.getpid()}_{i}.txt")
+            line = line if line.strip() else " "
+            if self._text_cache.get(i) != line or not os.path.exists(path):
+                with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(line)
+                self._text_cache[i] = line
+            paths.append(path)
+        return paths
+
     # ------------------------------------------------------------------
     def _eq_chain(self) -> list[str]:
         chain, eq = [], []
@@ -282,10 +316,12 @@ class EffectsTab(BaseTab):
             return args + [dst]
 
         if op == "text_wm":
+            files = self._text_files(self.wm_text.get())
+            self._aux_files = list(files)
             pos = builder.overlay_position(self.wm_pos.get(), self._safe_int(self.wm_margin.get(), 20))
             x, y = pos.split(":")
-            texts = builder.drawtext_block(
-                self.wm_text.get(),
+            texts = builder.drawtext_lines(
+                [escape_filter_path(p) for p in files],
                 escape_filter_path(self.app.font_path) if self.app.font_path else "",
                 size=self._safe_int(self.wm_size.get(), 32),
                 color=self.wm_color.get(),

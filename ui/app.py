@@ -562,7 +562,22 @@ class App(tk.Tk):
     # ==================================================================
     # 预览 / 日志 / 状态
     # ==================================================================
+    def _runner_busy(self) -> bool:
+        """当前是否有任务在跑。异常时按“没有在跑”处理，绝不阻塞界面逻辑。"""
+        runner = self.runner
+        if runner is None:
+            return False
+        try:
+            return bool(runner.is_alive())
+        except Exception:
+            return False
+
     def _poll_preview(self):
+        self._refresh_preview_text()
+        self.after(700, self._poll_preview)
+
+    def _refresh_preview_text(self):
+        """重算并显示命令行预览。任何异常都不应影响界面其它逻辑。"""
         try:
             tab = self.current_tab()
             if tab is not None and tab.runnable:
@@ -578,8 +593,8 @@ class App(tk.Tk):
                 cmd = "（当前页面不执行转码）"
             else:
                 cmd = ""
-            # 处理任务执行中的
-            if self.runner and self.runner.is_alive():
+            # 任务执行中不覆盖预览，改为提示（执行中的完整命令已打印在日志里）
+            if self._runner_busy():
                 cmd = "正在执行…（命令行已在上方日志中输出）"
             if cmd != self._last_preview:
                 self._last_preview = cmd
@@ -589,7 +604,6 @@ class App(tk.Tk):
                 self.cmd_text.configure(state="disabled")
         except Exception:
             pass
-        self.after(700, self._poll_preview)
 
     def _copy_command(self):
         text = self.cmd_text.get("1.0", "end").strip()
@@ -681,7 +695,7 @@ class App(tk.Tk):
         return jobs, None
 
     def on_start(self):
-        if self.runner and self.runner.is_alive():
+        if self._runner_busy():
             return
         if not self.ffmpeg_path:
             messagebox.showerror("未找到 ffmpeg", self.startup_error or "请先安装 ffmpeg 并加入 PATH。")
@@ -732,7 +746,7 @@ class App(tk.Tk):
         self.runner.start()
 
     def on_cancel(self):
-        if self.runner and self.runner.is_alive():
+        if self._runner_busy():
             self.runner.cancel()
             self.status_text.set("正在停止…")
             self.log("已请求停止，等待当前任务退出…", "warn")
@@ -799,6 +813,8 @@ class App(tk.Tk):
             self.log(f"■ {msg}", "error")
         self.status_text.set(msg)
         self._last_preview = ""
+        # 任务刚结束，立即把预览恢复成真实命令行，不必等下一轮轮询
+        self._refresh_preview_text()
 
     def _cleanup_tabs(self):
         """清理各功能页产生的临时文件（拼接清单、水印文本等）。"""
@@ -818,8 +834,13 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------
     def _on_close(self):
-        if self.runner and self.runner.is_alive():
-            if not messagebox.askyesno("正在处理", "还有任务正在执行，确定要退出吗？\n退出会中断当前任务。"):
-                return
-            self.runner.cancel()
+        # 无论出现什么异常，都必须能关掉窗口
+        try:
+            if self._runner_busy():
+                if not messagebox.askyesno("正在处理",
+                                           "还有任务正在执行，确定要退出吗？\n退出会中断当前任务。"):
+                    return
+                self.runner.cancel()
+        except Exception:
+            pass
         self.destroy()

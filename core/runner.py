@@ -70,13 +70,16 @@ class JobRunner(threading.Thread):
         self.overwrite = overwrite
 
         self._proc: subprocess.Popen | None = None
-        self._stop = threading.Event()
+        # 注意：不要把这个 Event 命名为 self._stop —— 那会覆盖
+        # threading.Thread 的内部方法 _stop()，导致线程结束后
+        # is_alive() 抛 TypeError（历史上踩过这个坑）。
+        self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self.results: list[tuple[str, bool, str]] = []
 
     # -- 控制 -------------------------------------------------------------
     def cancel(self):
-        self._stop.set()
+        self._stop_event.set()
         with self._lock:
             proc = self._proc
         if proc and proc.poll() is None:
@@ -96,7 +99,7 @@ class JobRunner(threading.Thread):
 
     @property
     def cancelled(self) -> bool:
-        return self._stop.is_set()
+        return self._stop_event.is_set()
 
     # -- 主流程 -----------------------------------------------------------
     def run(self):
@@ -104,7 +107,7 @@ class JobRunner(threading.Thread):
         ok_all = True
         message = ""
         for i, job in enumerate(self.jobs):
-            if self._stop.is_set():
+            if self._stop_event.is_set():
                 ok_all = False
                 message = "已取消"
                 break
@@ -114,7 +117,7 @@ class JobRunner(threading.Thread):
             self.on_job_done(i, job, ok, msg)
             if not ok:
                 ok_all = False
-                if self._stop.is_set():
+                if self._stop_event.is_set():
                     message = "已取消"
                     break
                 message = msg
@@ -214,7 +217,7 @@ class JobRunner(threading.Thread):
         with self._lock:
             self._proc = None
 
-        if self._stop.is_set():
+        if self._stop_event.is_set():
             try:
                 if os.path.exists(job.dst):
                     os.remove(job.dst)

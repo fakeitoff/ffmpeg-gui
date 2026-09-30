@@ -242,30 +242,20 @@ def atempo_chain(speed: float) -> str:
     return ",".join(parts)
 
 
-def escape_drawtext_text(text: str) -> str:
-    """drawtext 的 ``text=`` 取值转义（配合 ``expansion=none`` 使用）。
-
-    只需处理滤镜图解析层会吃掉的三个字符：``\\``、``'``、``:``。
-    ``%`` 因为 expansion=none 不会被当作表达式，无需处理。
-    """
-    s = str(text).replace("\\", "\\\\")
-    s = s.replace("'", "\\'")
-    s = s.replace(":", "\\:")
-    return s
-
-
-def drawtext_filter(text: str, font_escaped: str, size=32, color="white",
+def drawtext_filter(textfile_escaped: str, font_escaped: str, size=32, color="white",
                     border=2, border_color="black", x="20", y="20", alpha=1.0,
                     box=False, box_color="black@0.5", box_border=8,
                     font_size_expr=None, extra: str = "") -> str:
     """构建单行 drawtext 滤镜串。
 
-    文本直接内联到 ``text=``（无需生成临时文本文件），中文与特殊字符均安全。
+    文本走 ``textfile`` 参数（配合 ``expansion=none``）：中文、引号、冒号、
+    方括号、百分号等全部原样输出，**完全不存在转义问题**。
+    注意文本文件内容不要带换行——ffmpeg 会把换行符本身画成一个方块。
     """
     size_val = font_size_expr if font_size_expr else str(int(size))
     opts = [
         f"fontfile='{font_escaped}'",
-        f"text='{escape_drawtext_text(text)}'",
+        f"textfile='{textfile_escaped}'",
         "expansion=none",
         f"fontsize={size_val}",
         f"fontcolor={color}",
@@ -283,26 +273,24 @@ def drawtext_filter(text: str, font_escaped: str, size=32, color="white",
     return "drawtext=" + ":".join(opts)
 
 
-def drawtext_block(text: str, font_escaped: str, size=32, color="white",
-                   border=2, border_color="black", x="20", y="20", alpha=1.0,
-                   box=False, box_color="black@0.5", box_border=8,
+def drawtext_lines(textfiles_escaped: list[str], font_escaped: str, size=32,
+                   color="white", border=2, border_color="black", x="20", y="20",
+                   alpha=1.0, box=False, box_color="black@0.5", box_border=8,
                    line_spacing: float = 1.25) -> list[str]:
-    """构建可能多行的水印滤镜串列表（每行一个 drawtext）。
+    """多行水印：每个文本文件对应一行，返回一组 drawtext 滤镜串。
 
-    文本框整体锚定在 ``y`` 位置：上对齐位置向下延伸，下对齐 / 居中位置
-    向上回退，保证整块文字不会跑出画面。
+    整块文字锚定在 ``y`` 位置——上对齐位置向下延伸，下对齐 / 居中位置向上回退，
+    保证文字不会跑出画面。
     """
-    lines = str(text).splitlines()
-    if not lines:
-        lines = [""]
-    if len(lines) == 1:
-        return [drawtext_filter(lines[0], font_escaped, size=size, color=color,
+    files = list(textfiles_escaped) or [""]
+    if len(files) == 1:
+        return [drawtext_filter(files[0], font_escaped, size=size, color=color,
                                 border=border, border_color=border_color, x=x, y=y,
                                 alpha=alpha, box=box, box_color=box_color,
                                 box_border=box_border)]
 
     lh = max(1, int(round(int(str(size)) * line_spacing)))
-    n = len(lines)
+    n = len(files)
     ystr = str(y)
     if "H-h" in ystr or "H-" in ystr:
         base = f"{ystr}-{(n - 1) * lh}"
@@ -311,9 +299,9 @@ def drawtext_block(text: str, font_escaped: str, size=32, color="white",
     else:
         base = ystr
     out = []
-    for i, line in enumerate(lines):
+    for i, path in enumerate(files):
         yi = base if i == 0 else f"{base}+{i * lh}"
-        out.append(drawtext_filter(line, font_escaped, size=size, color=color,
+        out.append(drawtext_filter(path, font_escaped, size=size, color=color,
                                    border=border, border_color=border_color, x=x, y=yi,
                                    alpha=alpha, box=box, box_color=box_color,
                                    box_border=box_border))
