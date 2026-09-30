@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 from core.probe import locate, probe                      # noqa: E402
-from core.runner import Job                               # noqa: E402
+from core.runner import Job, Progress                     # noqa: E402
 from core.util import local_temp_dir, popen_kwargs        # noqa: E402
 
 results: list[tuple[str, bool, str]] = []
@@ -248,6 +248,16 @@ def main():
         lambda: (t.side_layout.set("vstack"), t.side_audio.set("mix"),
                  t.side_size.set("640 × 360    (360p)")))
 
+    # 拼接的预期时长必须是各段之和（否则进度条百分比算错）
+    t.operation.set("首尾拼接 · 把多个视频接成一段")
+    t._on_operation()
+    t.join_mode.set("copy")
+    t._on_join_mode()
+    exp_dur = (app.get_info(a).duration or 0) + (app.get_info(b).duration or 0)
+    got_dur = t.expected_duration(a)
+    check("拼接预期时长 = 各段之和", bool(got_dur) and abs(got_dur - exp_dur) < 0.05,
+          f"{got_dur:.2f}s vs {exp_dur:.2f}s")
+
     # 命令行预览稳定性 + 临时文件策略
     t.operation.set("首尾拼接 · 把多个视频接成一段")
     t._on_operation()
@@ -417,6 +427,25 @@ def main():
 
     run_cycle(1)
     run_cycle(2)
+
+    # ---- 12b. 进度条行为（回归：曾「一直 0% 不动」）----
+    # 1) 时长已知：进度条数值必须随进度变化，并显示百分比/已用时
+    app._reset_progress()
+    app._apply_progress(Progress(job_total=1, percent=0.0, overall=0.0, has_duration=True))
+    v0 = float(app.progress.cget("value"))
+    app._apply_progress(Progress(job_total=1, percent=42.0, overall=42.0, has_duration=True,
+                                 out_time=12.0, elapsed=3.0, speed="2.0x"))
+    v1 = float(app.progress.cget("value"))
+    check("时长已知：进度条随进度变化", v0 == 0 and abs(v1 - 42.0) < 0.01, f"{v0} → {v1}")
+    check("时长已知：显示百分比", app.percent_text.get() == "42.0%", app.percent_text.get())
+    check("时长已知：状态栏含已用时", "已用时" in app.status_text.get(), app.status_text.get())
+    # 2) 时长未知：必须退化为滚动动画，不能冻在 0%
+    app._apply_progress(Progress(job_total=1, percent=0.0, has_duration=False, elapsed=2.0))
+    check("时长未知：切换为滚动动画", str(app.progress.cget("mode")) == "indeterminate",
+          str(app.progress.cget("mode")))
+    check("时长未知：显示「处理中」", app.percent_text.get() == "处理中", app.percent_text.get())
+    app._reset_progress()
+    check("重置后回到确定模式", str(app.progress.cget("mode")) == "determinate")
 
     # ---- 13. 布局检查：同一格子（列区间相交）里不能有两个控件 ----
     # 回归点：自定义命令页曾手工推算 grid 行号，导致「常用参数片段」按钮网格

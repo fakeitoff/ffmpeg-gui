@@ -93,6 +93,8 @@ class App(tk.Tk):
         self._font_path: str = ""
         self._last_preview = ""
         self._last_output_dir = ""
+        self._log_buffer: list[tuple[str, str]] = []
+        self._log_dirty = False
 
         self.log_level = tk.StringVar(value="info")
         self.out_mode = tk.StringVar(value="auto")
@@ -622,10 +624,27 @@ class App(tk.Tk):
             self.status_text.set("命令已复制到剪贴板")
 
     def _clear_log(self):
+        self._log_buffer.clear()
+        self._log_dirty = False
         self.log_panel.clear()
 
     def log(self, line: str, kind: str = "info"):
-        self.log_panel.write(line, kind)
+        """写日志。先入缓冲区，由 _drain_queue 每 120ms 批量刷一次 —— 逐行
+        直接插入 Text 在长任务里会明显拖慢界面（进度条看起来就像卡住）。"""
+        self._log_buffer.append((line, kind))
+        if len(self._log_buffer) > 6000:
+            del self._log_buffer[:3000]
+        self._log_dirty = True
+
+    def _flush_log(self):
+        if not self._log_dirty:
+            return
+        self._log_dirty = False
+        items, self._log_buffer = self._log_buffer, []
+        try:
+            self.log_panel.write_many(items)
+        except Exception:
+            pass
 
     def set_hint(self, text: str):
         self.status_text.set(text)
@@ -700,7 +719,7 @@ class App(tk.Tk):
             dst = tab.resolve_output(src, dst)
             args = tab.build_cmd(src, dst)
             jobs = [Job(src, dst, args,
-                        duration=(self.info.duration if self.info else 0.0),
+                        duration=tab.expected_duration(src) or 0.0,
                         aux_files=tab.aux_files())]
             return jobs, None
 
@@ -713,10 +732,9 @@ class App(tk.Tk):
             dst = tab.resolve_output(src, dst)
             if same_file(src, dst):
                 return None, f"输出路径与源文件相同，会导致源文件被覆盖：\n{dst}"
-            info = self.get_info(src)
             args = tab.build_cmd(src, dst)
             jobs.append(Job(src, dst, args,
-                            duration=(info.duration if info else 0.0),
+                            duration=tab.expected_duration(src) or 0.0,
                             aux_files=tab.aux_files()))
         return jobs, None
 
@@ -755,8 +773,12 @@ class App(tk.Tk):
 
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
-        self.progress.configure(value=0)
-        self.percent_text.set("0.0%")
+        self._reset_progress()
+        if jobs[0].duration > 0:
+            extra = f"（共 {len(jobs)} 个任务）" if len(jobs) > 1 else ""
+            self.log(f"预计输出时长：{format_time(jobs[0].duration)}{extra}", "dim")
+        else:
+            self.log("无法确定输出时长，进度条将以「处理中」动画显示", "warn")
 
         self.runner = JobRunner(
             jobs,
@@ -809,19 +831,50 @@ class App(tk.Tk):
                     self._on_finished(event[1], event[2])
         except Exception:
             pass
+        self._flush_log()
         self._drain_after = self.after(120, self._drain_queue)
 
+    def _set_progress_determinate(self):
+        try:
+            if str(self.progress.cget("mode")) != "determinate":
+                self.progress.stop()
+                self.progress.configure(mode="determinate")
+        except tk.TclError:
+            pass
+
+    def _set_progress_indeterminate(self):
+        try:
+            if str(self.progress.cget("mode")) != "indeterminate":
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(55)
+        except tk.TclError:
+            pass
+
+    def _reset_progress(self):
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate", value=0)
+        except tk.TclError:
+            pass
+        self.percent_text.set("0.0%")
+
     def _apply_progress(self, p):
-        if p.job_total > 1:
-            self.progress.configure(value=p.overall)
-            self.percent_text.set(f"{p.overall:.1f}%")
+        value = p.overall if p.job_total > 1 else p.percent
+        if p.has_duration:
+            self._set_progress_determinate()
+            self.progress.configure(value=value)
+            self.percent_text.set(f"{value:.1f}%")
         else:
-            self.progress.configure(value=p.percent)
-            self.percent_text.set(f"{p.percent:.1f}%")
+            # 预期总时长未知（源文件探测失败等）时，改用滚动动画表示「正在处理」，
+            # 而不是让进度条冻在 0% —— 看起来像卡死。
+            self._set_progress_indeterminate()
+            self.percent_text.set("处理中")
+
         parts = []
         if p.job_total > 1:
             parts.append(f"第 {p.job_index + 1}/{p.job_total} 个")
         parts.append(f"已处理 {format_time(p.out_time, 1)}")
+        parts.append(f"已用时 {format_time(p.elapsed, 0)}")
         if p.speed:
             parts.append(f"速度 {p.speed}")
         if p.fps:
@@ -833,6 +886,7 @@ class App(tk.Tk):
     def _on_finished(self, ok, msg):
         self.btn_start.configure(state="normal" if (self.current_tab() or self.src_files) else "disabled")
         self.btn_cancel.configure(state="disabled")
+        self._reset_progress()
         if ok:
             self.progress.configure(value=100)
             self.percent_text.set("100%")
@@ -841,6 +895,7 @@ class App(tk.Tk):
             self.log(f"■ {msg}", "error")
         self.status_text.set(msg)
         self._last_preview = ""
+        self._flush_log()
         # 任务刚结束，立即把预览恢复成真实命令行，不必等下一轮轮询
         self._refresh_preview_text()
 

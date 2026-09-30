@@ -306,6 +306,25 @@ class MergeTab(BaseTab):
         return {"concat": "_merged", "mux": "_muxed",
                 "multitrack": "_multitrack", "side": "_sidebyside"}[self._op_key()]
 
+    def expected_duration(self, src: str) -> float | None:
+        """拼接后总时长 = 各段之和（减去转场重叠），否则进度条百分比会算错。"""
+        if self._op_key() != "concat":
+            return super().expected_duration(src)
+        sources = list(self.app.src_files) or [src]
+        total = 0.0
+        for p in sources:
+            d = self._duration(p)
+            if d <= 0:
+                return None
+            total += d
+        if self.join_mode.get() == "reencode" and self.transition_on.get():
+            try:
+                trans = float(self.transition_dur.get())
+            except ValueError:
+                trans = 0.0
+            total -= trans * max(0, len(sources) - 1)
+        return total if total > 0 else None
+
     def aux_files(self) -> list[str]:
         return list(self._aux_files)
 

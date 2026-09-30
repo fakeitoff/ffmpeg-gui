@@ -114,6 +114,16 @@ class BaseTab(ttk.Frame):
     def src_duration(self) -> float:
         return float(self.app.info.duration) if self.app.info else 0.0
 
+    def expected_duration(self, src: str) -> float | None:
+        """预估本次输出的时长（秒），用于进度条百分比；``None`` 表示未知。
+
+        默认按「时长不变」处理（绝大多数转码 / 滤镜操作），并按**当前这个文件**
+        取时长——批量处理时每个文件长度不同，不能统一用第一个文件的。
+        拼接、合并等会改变时长的操作由对应页面覆写。
+        """
+        info = self.app.get_info(src)
+        return float(info.duration) if info and info.duration else None
+
     def notify_output_changed(self):
         """当输出扩展名等发生变化时通知主窗口刷新命名。"""
         self.app.refresh_auto_output()

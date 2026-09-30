@@ -242,9 +242,37 @@ class LogPanel(ttk.Frame):
         except tk.TclError:
             pass
 
+    # 超过这个行数就丢弃最旧的，避免长时间任务把 Text 撑到几万行拖慢重绘
+    MAX_LINES = 4000
+
     def write(self, line: str, kind: str = "info"):
-        self.text.insert("end", line + "\n", kind)
+        self.write_many([(line, kind)])
+
+    def write_many(self, items):
+        """批量写入日志。合并连续同类型标签后一次性插入，减少 Tcl 调用。"""
+        if not items:
+            return
+        buf: list[str] = []
+        cur = "info"
+        for line, kind in items:
+            k = kind or "info"
+            if k != cur and buf:
+                self.text.insert("end", "\n".join(buf) + "\n", cur)
+                buf = []
+            cur = k
+            buf.append(str(line))
+        if buf:
+            self.text.insert("end", "\n".join(buf) + "\n", cur)
+        self._trim()
         self.text.see("end")
+
+    def _trim(self):
+        try:
+            total = int(self.text.index("end-1c").split(".")[0])
+            if total > self.MAX_LINES:
+                self.text.delete("1.0", f"{total - self.MAX_LINES}.0")
+        except (tk.TclError, ValueError):
+            pass
 
     def clear(self):
         self.text.delete("1.0", "end")

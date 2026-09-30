@@ -47,6 +47,8 @@ class Progress:
     size: str = ""
     frame: str = ""
     state: str = "idle"      # idle / running / done / error / cancelled
+    elapsed: float = 0.0     # 本任务已运行秒数
+    has_duration: bool = True   # 是否知道预期总时长（否则无法算百分比）
 
 
 class JobRunner(threading.Thread):
@@ -145,6 +147,7 @@ class JobRunner(threading.Thread):
         errors: list[str] = []
         progress_holder = {
             "out_time": 0.0, "speed": "", "fps": "", "frame": "", "size": "",
+            "started": time.time(),
         }
 
         def pump_stderr():
@@ -261,5 +264,7 @@ class JobRunner(threading.Thread):
             size=holder["size"],
             frame=holder["frame"],
             state=state,
+            elapsed=max(0.0, time.time() - holder.get("started", time.time())),
+            has_duration=duration > 0,
         )
         self.on_progress(p)
