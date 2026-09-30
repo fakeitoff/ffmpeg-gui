@@ -395,6 +395,12 @@ class FileListBox(ttk.Frame):
 
 
 class ScrollFrame(ttk.Frame):
+    """带滚动条的容器。
+
+    内容比可视区窄时横向撑满窗口；一旦某个页面的控件排得太宽
+    （小屏幕或高缩放比下很容易发生），自动出现横向滚动条兜底，
+    不会出现「右边被切掉、看不到也够不着」的情况。
+    """
 
     def __init__(self, master, bg: str = theme.PANEL):
         super().__init__(master, style="Panel.TFrame")
@@ -405,7 +411,8 @@ class ScrollFrame(ttk.Frame):
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.vsb.grid(row=0, column=1, sticky="ns")
-        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
 
         self.inner = ttk.Frame(self.canvas, style="Panel.TFrame")
         self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
@@ -417,9 +424,31 @@ class ScrollFrame(ttk.Frame):
 
     def _on_inner(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._sync_hbar()
+
+    def _sync_hbar(self):
+        """只有在内容确实超出可视宽度时才显示横向滚动条。"""
+        try:
+            need = self.inner.winfo_reqwidth() > self.canvas.winfo_width() + 1
+            if need and not self.hsb.winfo_ismapped():
+                self.hsb.grid(row=1, column=0, sticky="ew")
+            elif not need and self.hsb.winfo_ismapped():
+                self.hsb.grid_remove()
+        except tk.TclError:
+            pass
 
     def _on_canvas(self, event):
-        self.canvas.itemconfigure(self._win, width=event.width)
+        # 内容自然宽度大于可视区时不要压窄它（否则右侧会被裁掉），
+        # 保持原宽并交给横向滚动条；否则横向撑满窗口。
+        try:
+            need = self.inner.winfo_reqwidth()
+            want = max(event.width, need)
+            if getattr(self, "_last_win_w", None) != want:
+                self._last_win_w = want
+                self.canvas.itemconfigure(self._win, width=want)
+        except tk.TclError:
+            return
+        self._sync_hbar()
 
     def _wheel(self, enabled: bool):
         if enabled:

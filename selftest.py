@@ -167,9 +167,45 @@ def main():
 
     # ---- 5. 特效 ----
     t = tabs["EffectsTab"]
-    run("特效 变速 2x", t, "13_speed.mp4",
+    run("特效 变速 2x（同步变速）", t, "13_speed.mp4",
         lambda: (t.operation.set("变速（快放 / 慢放，声音同步变调不变）"), t._on_operation(),
-                 t.speed.set("2.0")))
+                 t.speed.set("2.0"), t.audio_mode.set("sync")))
+    run("特效 变速 0.5x（保留原音频）", t, "13b_speed_keep.mp4",
+        lambda: (t.speed.set("0.5"), t.audio_mode.set("keep")))
+    run("特效 变速 3x（丢弃音频）", t, "13c_speed_mute.mp4",
+        lambda: (t.speed.set("3.0"), t.audio_mode.set("none")))
+
+    # 变速的音轨校验
+    for name, want_audio in (("13_speed.mp4", True),
+                             ("13b_speed_keep.mp4", True),
+                             ("13c_speed_mute.mp4", False)):
+        try:
+            sinfo = probe(ffprobe, os.path.join(tmp, name))
+            n_audio = sum(1 for s in sinfo.streams if s.type == "audio")
+            check(f"{name} 音轨数{'>0' if want_audio else '=0'}",
+                  (n_audio > 0) if want_audio else (n_audio == 0),
+                  f"{n_audio} 条 · {sinfo.describe()}")
+        except Exception as exc:  # noqa: BLE001
+            check(f"{name} 音轨校验", False, str(exc))
+
+    # 关键回归：ffprobe 探测结果不可用时（未返回/失败），绝不能据此丢弃音轨
+    saved_info = app.info
+    try:
+        app.info = None
+        t.operation.set("变速（快放 / 慢放，声音同步变调不变）")
+        t._on_operation()
+        t.audio_mode.set("sync")
+        args_no_probe = t.build_cmd(a, os.path.join(tmp, "probe_none.mp4"))
+        check("探测不可用时变速仍不丢音轨（命令无 -an）",
+              "-an" not in args_no_probe, " ".join(args_no_probe))
+        t.operation.set("文字水印")
+        t._on_operation()
+        args_wm = t.build_cmd(a, os.path.join(tmp, "probe_none_wm.mp4"))
+        check("探测不可用时水印仍不丢音轨（命令无 -an）",
+              "-an" not in args_wm, " ".join(args_wm))
+    finally:
+        app.info = saved_info
+
     run("特效 文字水印", t, "14_textwm.mp4",
         lambda: (t.operation.set("文字水印"), t._on_operation(),
                  t.wm_text.set("中文水印: 100% 'ok' [测试]\\n第二行")))

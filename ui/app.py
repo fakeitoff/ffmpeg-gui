@@ -111,8 +111,9 @@ class App(tk.Tk):
                 pass
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(120, self._drain_queue)
-        self.after(600, self._poll_preview)
+        self._closing = False
+        self._drain_after = self.after(120, self._drain_queue)
+        self._preview_after = self.after(600, self._poll_preview)
 
         if self.startup_error:
             self.log(self.startup_error, "error")
@@ -351,16 +352,22 @@ class App(tk.Tk):
             self._font_path = probe_mod.pick_font()
         return self._font_path
 
-    def get_info(self, path: str):
-        """带缓存的 ffprobe 调用；失败返回 None。"""
-        if path in self.info_cache:
+    def get_info(self, path: str, refresh: bool = False):
+        """带缓存的 ffprobe 调用；失败返回 None。
+
+        ``refresh=True`` 强制重新探测（真正开工前使用，避免用到过期或失败的缓存）。
+        """
+        if not refresh and path in self.info_cache:
             return self.info_cache[path]
-        result = None
         try:
             result = probe_mod.probe(self.ffprobe_path, path)
         except Exception:
             result = None
-        self.info_cache[path] = result
+        if result is not None:
+            self.info_cache[path] = result
+        elif not refresh:
+            # 失败的探测结果也缓存，避免命令行预览反复重试拖慢界面
+            self.info_cache[path] = None
         return result
 
     def probe_ok(self, path: str) -> bool:
@@ -573,8 +580,10 @@ class App(tk.Tk):
             return False
 
     def _poll_preview(self):
+        if self._closing:
+            return
         self._refresh_preview_text()
-        self.after(700, self._poll_preview)
+        self._preview_after = self.after(700, self._poll_preview)
 
     def _refresh_preview_text(self):
         """重算并显示命令行预览。任何异常都不应影响界面其它逻辑。"""
@@ -651,6 +660,23 @@ class App(tk.Tk):
         tab = self.current_tab()
         if tab is None:
             return [], "没有可用的功能页"
+
+        # 开工前重新探测：期间文件可能被替换过，或上次探测失败。
+        # 这个结果会影响「是否需要重新编码」「有没有音轨」等自动判断。
+        if self.src_files:
+            if len(self.src_files) > 1:
+                self.status_text.set(f"正在读取媒体信息…（共 {len(self.src_files)} 个文件）")
+                self.update_idletasks()
+            for path in self.src_files:
+                self.get_info(path, refresh=True)
+            self.info = self.info_cache.get(self.src_files[0])
+            if self.info is None:
+                self.log(f"警告：ffprobe 无法解析 {os.path.basename(self.src_files[0])}，"
+                         "部分自动判断可能不准确", "warn")
+            try:
+                tab.on_src_changed()
+            except Exception:
+                pass
 
         error = tab.validate()
         if error:
@@ -753,6 +779,8 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------
     def _drain_queue(self):
+        if self._closing:
+            return
         try:
             for _ in range(80):
                 try:
@@ -781,7 +809,7 @@ class App(tk.Tk):
                     self._on_finished(event[1], event[2])
         except Exception:
             pass
-        self.after(120, self._drain_queue)
+        self._drain_after = self.after(120, self._drain_queue)
 
     def _apply_progress(self, p):
         if p.job_total > 1:
@@ -825,7 +853,17 @@ class App(tk.Tk):
                 pass
 
     def destroy(self):
-        # 无论是点关闭按钮还是被程序化销毁，都先归还临时文件
+        # 先停掉定时回调，再清理临时文件，避免退出后 Tcl 报
+        # 「invalid command name ..._drain_queue」
+        self._closing = True
+        for attr in ("_drain_after", "_preview_after"):
+            aid = getattr(self, attr, None)
+            if aid:
+                try:
+                    self.after_cancel(aid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         self._cleanup_tabs()
         try:
             super().destroy()

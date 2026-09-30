@@ -27,6 +27,13 @@ OP_LABEL = {key: label for key, label in OPERATIONS}
 POSITIONS = ["左上", "上中", "右上", "左中", "正中", "右中", "左下", "下中", "右下"]
 TEXT_COLORS = ["white", "black", "yellow", "red", "green", "blue", "orange", "#00c8ff"]
 
+# 变速时的音频处理方式：(键, 说明)
+SPEED_AUDIO_MODES = [
+    ("sync", "同步变速（保持音调）"),
+    ("keep", "保留原音频（会不同步）"),
+    ("none", "丢弃音频（静音）"),
+]
+
 
 class EffectsTab(BaseTab):
     name = "特效 / 叠加"
@@ -47,7 +54,7 @@ class EffectsTab(BaseTab):
 
         # 变速
         self.speed = tk.StringVar(value="2.0")
-        self.keep_audio = tk.BooleanVar(value=True)
+        self.audio_mode = tk.StringVar(value="sync")
 
         # 水印
         self.wm_text = tk.StringVar(value="示例水印")
@@ -113,7 +120,10 @@ class EffectsTab(BaseTab):
         self.speed_box = self._new_box()
         g = _SubForm(self.speed_box)
         g.field_hint("速度倍率", self.speed, "倍", "2 = 两倍速快放，0.5 = 慢放一半")
-        g.check("", self.keep_audio, "音频同步变速（保持音调，关闭则丢弃音频）")
+        g.radio_row("音频处理", self.audio_mode, SPEED_AUDIO_MODES)
+        g.note("① 同步变速：用 atempo 同步处理音频，音调不变、声画保持一致（推荐）。\n"
+               "② 保留原音频：只变速画面，音频原样复制，结果会声画不同步。\n"
+               "③ 丢弃音频：输出无声视频。")
 
         # --- 文字水印 ---
         self.text_wm_box = self._new_box()
@@ -257,10 +267,16 @@ class EffectsTab(BaseTab):
             crf = 18
         return builder.video_encode_args(self.venc.get(), crf=crf, preset=self.preset.get())
 
-    def _reencode_tail(self, encode_audio: bool = False) -> list[str]:
-        """视频重编码 + 音频处理方式（有音频滤镜时必须重新编码音频）。"""
+    def _reencode_tail(self, encode_audio: bool = False, drop_audio: bool = False) -> list[str]:
+        """视频重编码 + 音频处理方式。
+
+        音频怎么处理**完全由用户选项决定，不能用 ffprobe 的探测结果去推断**：
+        探测可能还没返回、或者失败，据此注入 ``-an`` 会把音频静默丢掉，
+        表现为「不管选哪个选项都没有声音」。源文件本来就没有音轨时，
+        ffmpeg 会忽略音频参数自己处理，不会报错。
+        """
         tail = self._encode_args()
-        if not self.has_audio():
+        if drop_audio:
             tail += ["-an"]
         elif encode_audio:
             tail += ["-c:a", "aac", "-b:a", "192k"]
@@ -309,10 +325,14 @@ class EffectsTab(BaseTab):
                 speed = 1.0
             vf = eq + [f"setpts={1.0 / speed:.6f}*PTS"]
             args = ["-i", src, "-vf", ",".join(vf)]
-            audio_filtered = self.has_audio() and self.keep_audio.get()
-            if audio_filtered:
+            mode = self.audio_mode.get()
+            if mode == "sync":
                 args += ["-af", builder.atempo_chain(speed)]
-            args += self._reencode_tail(encode_audio=audio_filtered)
+                args += self._reencode_tail(encode_audio=True)
+            elif mode == "keep":
+                args += self._reencode_tail(encode_audio=False)
+            else:
+                args += self._reencode_tail(drop_audio=True)
             return args + [dst]
 
         if op == "text_wm":
@@ -351,8 +371,8 @@ class EffectsTab(BaseTab):
             else:
                 graph += f";[0:v][ov]overlay={overlay_opts}[v]"
             args += ["-filter_complex", graph, "-map", "[v]"]
-            if self.has_audio():
-                args += ["-map", "0:a?", "-c:a", "copy"]
+            # -map 0:a? 带问号表示「有音轨就带上」，无需依赖探测结果
+            args += ["-map", "0:a?", "-c:a", "copy"]
             args += self._encode_args()
             return args + [dst]
 

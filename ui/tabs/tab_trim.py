@@ -152,10 +152,9 @@ class TrimTab(BaseTab):
 
         if encode:
             args += builder.video_encode_args("libx264", crf=18, preset="veryfast", pix_fmt="yuv420p")
-            if self.has_audio():
-                args += ["-c:a", "aac", "-b:a", "192k"]
-            else:
-                args += ["-an"]
+            # 直接指定音频编码器即可：源文件没有音轨时 ffmpeg 会自己忽略，
+            # 不能用 ffprobe 的探测结果去决定 -an（探测未就绪/失败会静默丢音轨）
+            args += ["-c:a", "aac", "-b:a", "192k"]
             args += ["-avoid_negative_ts", "make_zero"]
         else:
             args += ["-c", "copy", "-avoid_negative_ts", "make_zero"]

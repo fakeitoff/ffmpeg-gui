@@ -22,6 +22,82 @@ LOG_BG = "#fbfbfc"
 FONT = "Microsoft YaHei UI"
 MONO = "Consolas"
 
+# --------------------------------------------------------------------------
+# 自绘勾选指示器
+# clam 主题把 Checkbutton 的「已选中」画成一个叉号 ✗，反直觉（叉号通常表示
+# 禁用/取消），用户无法判断到底是勾上算生效还是不勾算生效。
+# 这里用点阵自绘 14×14 图标替换掉它：未选=空心方框，已选=蓝底白勾。
+# --------------------------------------------------------------------------
+_CHECK_SIZE = 14
+_TICK_PATTERN = [
+    "..............",
+    "..............",
+    "..............",
+    "..........XX..",
+    ".........XX...",
+    "........XX....",
+    "..X....XX.....",
+    "..XX..XX......",
+    "...XXXXX......",
+    "....XXX.......",
+    "....XX........",
+    "..............",
+    "..............",
+    "..............",
+]
+
+# 保存引用，防止 PhotoImage 被回收（被回收后控件图标会变空白）
+_check_images: dict = {}
+
+
+def _check_image(fill: str, border: str, tick: str | None = None) -> tk.PhotoImage:
+    img = tk.PhotoImage(width=_CHECK_SIZE, height=_CHECK_SIZE)
+    img.put("#ffffff", to=(0, 0, _CHECK_SIZE, _CHECK_SIZE))
+    if fill != "#ffffff":
+        img.put(fill, to=(1, 1, _CHECK_SIZE - 1, _CHECK_SIZE - 1))
+    img.put(border, to=(0, 0, _CHECK_SIZE, 1))
+    img.put(border, to=(0, _CHECK_SIZE - 1, _CHECK_SIZE, _CHECK_SIZE))
+    img.put(border, to=(0, 0, 1, _CHECK_SIZE))
+    img.put(border, to=(_CHECK_SIZE - 1, 0, _CHECK_SIZE, _CHECK_SIZE))
+    if tick:
+        for row, line in enumerate(_TICK_PATTERN):
+            for col, ch in enumerate(line):
+                if ch == "X":
+                    img.put(tick, to=(col, row, col + 1, row + 1))
+    return img
+
+
+def _install_check_indicator(style: ttk.Style):
+    """用自绘图标替换 Checkbutton 的指示器；失败时安静回退到主题默认。"""
+    try:
+        _check_images["off"] = _check_image("#ffffff", "#9aa3ad")
+        _check_images["on"] = _check_image(ACCENT, ACCENT, "#ffffff")
+        _check_images["disabled"] = _check_image("#f3f4f6", "#c9cdd3")
+        _check_images["disabled_on"] = _check_image("#b9c6de", "#b9c6de", "#ffffff")
+
+        style.element_create(
+            "Ffgui.Check.indicator", "image",
+            _check_images["off"],
+            ("selected", _check_images["on"]),
+            ("disabled", _check_images["disabled"]),
+            ("disabled", "selected", _check_images["disabled_on"]),
+            border=0, padding=(0, 0, 6, 0), sticky="")
+    except tk.TclError:
+        return
+
+    layout = [
+        ("Checkbutton.padding", {"sticky": "nswe", "children": [
+            ("Ffgui.Check.indicator", {"side": "left", "sticky": ""}),
+            ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
+                ("Checkbutton.label", {"sticky": "nswe"})]}),
+        ]}),
+    ]
+    # 子样式（如 Bg.TCheckbutton）会自动继承 TCheckbutton 的布局
+    try:
+        style.layout("TCheckbutton", layout)
+    except tk.TclError:
+        pass
+
 
 def setup_theme(root: tk.Tk):
     style = ttk.Style(root)
@@ -113,4 +189,7 @@ def setup_theme(root: tk.Tk):
                     arrowcolor=MUTED, relief="flat")
     style.configure("Horizontal.TScrollbar", background=SUB, troughcolor=BG, bordercolor=BG,
                     arrowcolor=MUTED, relief="flat")
+
+    # 必须在样式配置之后：用自绘勾号替换 clam 的叉号
+    _install_check_indicator(style)
     return style
