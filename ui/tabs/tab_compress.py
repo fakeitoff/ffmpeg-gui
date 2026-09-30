@@ -310,3 +310,13 @@ class CompressTab(BaseTab):
         if v == "自定义":
             return self.fps_custom.get().strip() or None
         return v
+
+    # -- 进度预估 ---------------------------------------------------------
+    def expected_frames(self, src: str) -> int:
+        """限制了输出帧率时，总帧数 = 时长 × 输出帧率，不能沿用源文件帧数。"""
+        fps = self._resolved_fps()
+        if fps:
+            n = self.frames_from_fps(self.expected_duration(src), fps)
+            if n > 0:
+                return n
+        return super().expected_frames(src)

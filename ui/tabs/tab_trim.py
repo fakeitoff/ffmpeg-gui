@@ -92,6 +92,28 @@ class TrimTab(BaseTab):
                 return start, max(0.0, e - start)
         return start, None
 
+    # -- 进度预估 ---------------------------------------------------------
+    def expected_duration(self, src: str) -> float | None:
+        """截取后的时长，而不是源文件总时长（否则进度条永远到不了 100%）。"""
+        try:
+            start, dur = self._times()
+        except ValueError:
+            return super().expected_duration(src)
+        start = start or 0.0
+        total = self.src_duration()
+        if dur is not None:
+            return dur if dur > 0 else None
+        # 未指定结束时间：截到结尾
+        if total > 0:
+            remain = total - start
+            return remain if remain > 0 else None
+        return None
+
+    def expected_frames(self, src: str) -> int:
+        """截取后的帧数 = 输出时长 × 源帧率（剪辑不改变帧率）。"""
+        # 快速模式用 -c copy，帧数不变但也不按帧重编码，按时间估算更稳
+        return self.frames_from_duration(src, self.expected_duration(src))
+
     def _filters(self) -> list[str]:
         chained: list[str] = []
         if self.crop_on.get():

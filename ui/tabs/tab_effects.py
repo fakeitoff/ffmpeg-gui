@@ -206,6 +206,29 @@ class EffectsTab(BaseTab):
                 "pip": "_pip", "burn_sub": "_sub",
                 "soft_sub": "_sub"}.get(self._op_key(), "_effect")
 
+    # -- 进度预估 ---------------------------------------------------------
+    def _speed_factor(self) -> float:
+        """变速倍率；无效或非正返回 0（表示不可用）。"""
+        if self._op_key() != "speed":
+            return 0.0
+        return self._positive_float(self.speed.get())
+
+    def expected_duration(self, src: str) -> float | None:
+        """变速会改变输出时长：2 倍速 → 时长减半。"""
+        base = super().expected_duration(src)
+        factor = self._speed_factor()
+        if factor <= 0 or not base:
+            return base
+        return base / factor
+
+    def expected_frames(self, src: str) -> int:
+        """变速不改变帧率，总帧数 = 原帧数 / 倍率。"""
+        factor = self._speed_factor()
+        if factor <= 0:
+            return super().expected_frames(src)
+        n = self.frames_from_duration(src, self.expected_duration(src))
+        return n if n > 0 else super().expected_frames(src)
+
     def output_ext(self) -> str:
         return self.app.src_ext() or "mp4"
 

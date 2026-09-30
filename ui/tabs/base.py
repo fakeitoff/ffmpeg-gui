@@ -128,10 +128,54 @@ class BaseTab(ttk.Frame):
         """预估本次输出的视频总帧数（用于按实际处理帧数算进度）；0 表示未知。
 
         默认等于源视频帧数（绝大多数转码 / 滤镜不改变帧数）。
-        会改变帧数的操作（拼接、剪辑、改帧率等）由对应页面覆写。
+        会改变帧数的操作（剪辑、改帧率、变速、拼接等）必须覆写本方法，
+        否则进度条会按源文件帧数去算，算出偏小的百分比并卡住。
         """
         info = self.app.get_info(src)
         return info.video_frames if info else 0
+
+    # -- 帧数预估辅助 ------------------------------------------------------
+    def src_fps(self, src: str) -> float:
+        """源文件的视频帧率；0 表示未知。"""
+        info = self.app.get_info(src)
+        if info is None or info.video is None:
+            return 0.0
+        return float(info.video.fps or 0.0)
+
+    def frames_from_duration(self, src: str, seconds: float | None) -> int:
+        """按时长 × 源帧率估算帧数；时长或帧率未知时返回 0。
+
+        适合「只改变时长、不改变帧率」的操作（如剪辑）。
+        输出帧率与源帧率不同时（改帧率、变速），请自行传入输出帧率。
+        """
+        if not seconds or seconds <= 0:
+            return 0
+        fps = self.src_fps(src)
+        if fps <= 0:
+            return 0
+        return max(1, int(round(seconds * fps)))
+
+    @staticmethod
+    def frames_from_fps(seconds: float | None, fps) -> int:
+        """按「输出时长 × 输出帧率」估算帧数；任一未知返回 0。"""
+        if not seconds or seconds <= 0:
+            return 0
+        try:
+            f = float(str(fps).strip())
+        except (TypeError, ValueError):
+            return 0
+        if f <= 0:
+            return 0
+        return max(1, int(round(seconds * f)))
+
+    @staticmethod
+    def _positive_float(value) -> float:
+        """把界面输入解析为正数；失败或非正返回 0。"""
+        try:
+            f = float(str(value).strip())
+        except (TypeError, ValueError):
+            return 0.0
+        return f if f > 0 else 0.0
 
     def notify_output_changed(self):
         """当输出扩展名等发生变化时通知主窗口刷新命名。"""

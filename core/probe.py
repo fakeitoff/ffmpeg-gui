@@ -95,7 +95,8 @@ def locate():
 def ffmpeg_version(ffmpeg_path: str) -> str:
     try:
         out = subprocess.run(
-            [ffmpeg_path, "-version"], text=True, timeout=15, **popen_kwargs()
+            [ffmpeg_path, "-version"], text=True, encoding="utf-8",
+            errors="replace", timeout=15, **popen_kwargs(),
         )
         first = (out.stdout or "").splitlines()
         return first[0].strip() if first else "未知版本"
@@ -130,7 +131,7 @@ class StreamInfo:
     __slots__ = (
         "index", "type", "codec", "profile", "width", "height", "fps",
         "sample_rate", "channels", "channel_layout", "bit_rate", "duration",
-        "lang", "title", "pix_fmt", "nb_frames", "raw",
+        "lang", "title", "pix_fmt", "nb_frames", "nb_packets", "raw",
     )
 
     def __init__(self, raw: dict):
@@ -149,6 +150,8 @@ class StreamInfo:
         self.duration = float(raw.get("duration") or 0.0)
         self.pix_fmt = raw.get("pix_fmt", "")
         self.nb_frames = _to_int(raw.get("nb_frames"))
+        # 由 -count_packets 兜底填充（并非所有 ffprobe 输出都带这个字段）
+        self.nb_packets = _to_int(raw.get("nb_read_packets"))
         tags = raw.get("tags") or {}
         self.lang = tags.get("language", "")
         self.title = tags.get("title", "")
@@ -224,14 +227,19 @@ class MediaInfo:
     def video_frames(self) -> int:
         """视频总帧数（用于按帧计算进度）。
 
-        优先用 ffprobe 报的 ``nb_frames``（精确），没有就用 时长 × 帧率 估算。
-        纯音频/未知返回 0。
+        依次尝试：ffprobe 的 ``nb_frames`` → ``-count_packets`` 统计的包数
+        → 时长 × 帧率估算。纯音频/未知返回 0。
+
+        中间的包数兜底很关键：H.264/HEVC 裸流、部分 TS/FLV、单张图片
+        既不写 nb_frames 也没有 duration，没有它就只能显示「处理中」动画。
         """
         v = self.video
         if v is None:
             return 0
         if v.nb_frames and v.nb_frames > 0:
             return v.nb_frames
+        if v.nb_packets and v.nb_packets > 0:
+            return v.nb_packets
         if v.fps and self.duration:
             return max(0, int(round(self.duration * float(v.fps))))
         return 0
@@ -274,6 +282,41 @@ class MediaInfo:
         return " · ".join(p for p in parts if p)
 
 
+def count_packets(ffprobe_path: str, path: str, timeout: int = 30) -> dict:
+    """用 ``-count_packets`` 统计各流的包数，返回 ``{流序号: 包数}``。
+
+    只读包头、不做解码，速度与 ``-show_streams`` 同级（毫秒级）。
+    用于 H.264/HEVC 裸流、部分 TS/FLV、单张图片等既不写 ``nb_frames``
+    也读不到 duration 的媒体——没有它就只能显示「处理中」动画。
+
+    文件很大时仍可能耗时较久，超时或失败一律返回空字典（退回原行为）。
+    """
+    cmd = [
+        ffprobe_path, "-v", "error", "-hide_banner",
+        "-print_format", "json",
+        "-show_streams", "-count_packets",
+        "-i", path,
+    ]
+    try:
+        proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, **popen_kwargs())
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    counts: dict = {}
+    for stream in (data.get("streams") or []):
+        idx = _to_int(stream.get("index"), -1)
+        num = _to_int(stream.get("nb_read_packets"))
+        if idx >= 0 and num > 0:
+            counts[idx] = num
+    return counts
+
+
 def probe(ffprobe_path: str, path: str, timeout: int = 30) -> MediaInfo:
     """调用 ffprobe 读取媒体信息（失败抛出 RuntimeError）。"""
     cmd = [
@@ -283,7 +326,13 @@ def probe(ffprobe_path: str, path: str, timeout: int = 30) -> MediaInfo:
         "-i", path,
     ]
     try:
-        proc = subprocess.run(cmd, text=True, timeout=timeout, **popen_kwargs())
+        # 必须显式指定 UTF-8：Windows 中文环境的默认编码是 GBK，
+        # 而 ffprobe 输出的是 UTF-8 JSON（内含 format.filename）。
+        # 用 GBK 解码会在读取线程里抛 UnicodeDecodeError，导致 stdout
+        # 变空、被解析成空信息（时长/帧数全为 0）——文件名含中文、
+        # 书名号《》、emoji 等字符时必现，进而让进度条退化成「处理中」。
+        proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, **popen_kwargs())
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"读取媒体信息超时：{os.path.basename(path)}") from None
     except OSError as exc:
@@ -296,7 +345,19 @@ def probe(ffprobe_path: str, path: str, timeout: int = 30) -> MediaInfo:
         raw = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError:
         raise RuntimeError("ffprobe 输出解析失败") from None
-    return MediaInfo(path, raw)
+    info = MediaInfo(path, raw)
+
+    # 常规容器（MP4/MOV/AVI 等）已带 nb_frames 或 duration，无需额外开销。
+    # 只有在「有视频流但既拿不到总帧数、也没有时长」时才回去数包，
+    # 例如 H.264/HEVC 裸流、部分 TS/FLV、单张图片。
+    # 这些文件没有兜底就只能显示「处理中」动画。
+    if info.has_video and not info.video_frames:
+        counts = count_packets(ffprobe_path, path, timeout=timeout)
+        v_index = info.video.index if info.video else -1
+        n = counts.get(v_index) or (max(counts.values()) if counts else 0)
+        if n > 0 and info.video is not None:
+            info.video.nb_packets = n
+    return info
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +376,8 @@ def available_encoders(ffmpeg_path: str) -> set[str]:
     try:
         out = subprocess.run(
             [ffmpeg_path, "-hide_banner", "-encoders"],
-            text=True, timeout=30, **popen_kwargs(),
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30, **popen_kwargs(),
         )
         for line in (out.stdout or "").splitlines():
             parts = line.split()
@@ -335,7 +397,8 @@ def available_filters(ffmpeg_path: str) -> set[str]:
     try:
         out = subprocess.run(
             [ffmpeg_path, "-hide_banner", "-filters"],
-            text=True, timeout=30, **popen_kwargs(),
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30, **popen_kwargs(),
         )
         for line in (out.stdout or "").splitlines():
             parts = line.split()

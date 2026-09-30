@@ -150,7 +150,7 @@ class JobRunner(threading.Thread):
         errors: list[str] = []
         progress_holder = {
             "out_time": 0.0, "speed": "", "fps": "", "frame": "", "frame_num": 0,
-            "size": "", "started": time.time(),
+            "size": "", "started": time.time(), "pct": 0.0,
         }
 
         def pump_stderr():
@@ -260,13 +260,31 @@ class JobRunner(threading.Thread):
         duration = job.duration or 0.0
         out_time = holder["out_time"]
         frame_num = holder.get("frame_num", 0) or 0
-        # 优先按实际处理帧数算百分比，帧数拿不到再退回按时间估算
-        if total_frames > 0:
-            pct = min(100.0, (frame_num / total_frames) * 100.0)
-        elif duration > 0:
-            pct = min(100.0, (out_time / duration) * 100.0)
-        else:
-            pct = 0.0
+
+        # 进度优先按「已处理帧数 / 预计输出总帧数」计算，但有两个坑必须绕开：
+        #   1) 提取音频、单张截图等输出没有视频帧（frame 恒为 0），
+        #      只看帧数会让进度条永远停在 0%；
+        #   2) 剪辑、改帧率、变速等操作的输出帧数与源文件不同，
+        #      只看帧数会算出偏小的百分比（例如 4 秒片段算成 20%）并卡住。
+        # 因此两种口径都算，取较大值互相兜底。
+        frame_pct = 0.0
+        if total_frames > 0 and frame_num > 0:
+            frame_pct = min(100.0, (frame_num / total_frames) * 100.0)
+        time_pct = 0.0
+        if duration > 0:
+            time_pct = min(100.0, (out_time / duration) * 100.0)
+        pct = max(frame_pct, time_pct)
+
+        # ffmpeg 明确报告 progress=end 时，该任务一定已经完整输出
+        if state == "done":
+            pct = 100.0
+
+        # 进度只能前进：避免某项指标抖动导致进度条回退
+        last_pct = holder.get("pct", 0.0)
+        if pct < last_pct:
+            pct = last_pct
+        holder["pct"] = pct
+
         overall = ((index + pct / 100.0) / max(1, total)) * 100.0
         p = Progress(
             job_index=index,

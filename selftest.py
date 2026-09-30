@@ -82,6 +82,44 @@ def main():
     check("ffprobe 解析源文件", app.info is not None,
           app.info.describe() if app.info else "解析失败")
 
+    # ---- 12a. 探测健壮性：文件名编码与无元数据的媒体 ----
+    # 回归点 1：ffprobe 输出 UTF-8 JSON，而 Windows 中文环境默认 GBK。
+    # 未显式指定 encoding 时，文件名含中文/《》/emoji 会让解码在读取线程里
+    # 抛异常，stdout 变空后被当成「空信息」（时长/帧数全 0），
+    # 于是进度条退化成「处理中」动画。
+    import shutil
+    weird = os.path.join(tmp, "《书名号》中文🎬测试.mp4")
+    try:
+        shutil.copyfile(a, weird)
+        winfo = probe(ffprobe, weird)
+        check("文件名含《》/中文/emoji 仍能解析出时长与帧数",
+              winfo is not None and winfo.duration > 0 and winfo.video_frames > 0,
+              f"时长={winfo.duration:.2f}s 帧数={winfo.video_frames}" if winfo else "解析失败")
+    except Exception as exc:  # noqa: BLE001
+        check("文件名含《》/中文/emoji 仍能解析出时长与帧数", False, str(exc))
+
+    # 回归点 2：H.264/HEVC 裸流、单张图片既不写 nb_frames 也读不到 duration，
+    # 必须靠 -count_packets 兜底，否则压缩页只能显示「处理中」。
+    raw = os.path.join(tmp, "raw_stream.h264")
+    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", a, "-c:v", "copy", "-bsf:v", "h264_mp4toannexb",
+                    "-an", raw], check=True, **popen_kwargs())
+    try:
+        rinfo = probe(ffprobe, raw)
+        check("H.264 裸流也能算出总帧数（包数兜底）",
+              rinfo is not None and rinfo.video_frames > 0,
+              f"帧数={rinfo.video_frames} 时长={rinfo.duration:.2f}s" if rinfo else "解析失败")
+    except Exception as exc:  # noqa: BLE001
+        check("H.264 裸流也能算出总帧数（包数兜底）", False, str(exc))
+
+    try:
+        iinfo = probe(ffprobe, logo)
+        check("单张图片也能算出帧数（包数兜底）",
+              iinfo is not None and iinfo.video_frames > 0,
+              f"帧数={iinfo.video_frames}" if iinfo else "解析失败")
+    except Exception as exc:  # noqa: BLE001
+        check("单张图片也能算出帧数（包数兜底）", False, str(exc))
+
     for tab in app.tabs:
         tab.on_src_changed()
 
@@ -470,6 +508,71 @@ def main():
               {"out_time": 5.0, "speed": "", "fps": "", "frame": "0", "frame_num": 0,
                "size": "", "started": time.time()}, "running")
     check("帧数未知时退回按时间估算：5s/10s → 50%", rec and abs(rec[-1].percent - 50.0) < 0.01,
+          f"{rec[-1].percent:.1f}%" if rec else "无回调")
+
+    # ---- 12c. 进度口径回归：帧数与时间取较大值，且进度只进不退 ----
+    # 回归点 1：剪辑/改帧率/变速后，输出帧数小于源帧数，
+    #           只按帧算会得出偏小百分比（如 4 秒片段算成 20%）并卡住。
+    #           此时应改用时间口径，让进度正常到 100%。
+    rec.clear()
+    _jr._emit(0, 1,
+              Job(a, os.path.join(tmp, "trim_probe.mp4"), [], duration=4.0, total_frames=120),
+              {"out_time": 3.6, "speed": "", "fps": "", "frame": "108", "frame_num": 108,
+               "size": "", "started": time.time()}, "running")
+    check("剪辑场景：帧口径 90% 与时间口径 90% 取较大值 → 90%",
+          rec and abs(rec[-1].percent - 90.0) < 0.01,
+          f"{rec[-1].percent:.1f}%" if rec else "无回调")
+    # 关键判别用例：帧数口径明显偏小（120/600 = 20%），
+    # 旧实现会停在 20%；新实现取时间口径 60%。
+    rec.clear()
+    _jr._emit(0, 1,
+              Job(a, os.path.join(tmp, "trim_probe3.mp4"), [], duration=10.0, total_frames=600),
+              {"out_time": 6.0, "speed": "", "fps": "", "frame": "120", "frame_num": 120,
+               "size": "", "started": time.time()}, "running")
+    check("剪辑场景：帧口径偏小(20%)时改用时间口径 → 60%",
+          rec and abs(rec[-1].percent - 60.0) < 0.01,
+          f"{rec[-1].percent:.1f}%（旧实现会停在 20%）" if rec else "无回调")
+    # 时间已经走完但帧数还差一截时，必须取较大值而不是被帧数拖住
+    rec.clear()
+    _jr._emit(0, 1,
+              Job(a, os.path.join(tmp, "trim_probe2.mp4"), [], duration=4.0, total_frames=600),
+              {"out_time": 4.0, "speed": "", "fps": "", "frame": "120", "frame_num": 120,
+               "size": "", "started": time.time()}, "running")
+    check("剪辑场景：帧口径只有 20% 时时间口径兜底 → 100%",
+          rec and abs(rec[-1].percent - 100.0) < 0.01,
+          f"{rec[-1].percent:.1f}%" if rec else "无回调")
+
+    # 回归点 2：纯音频提取时 frame 恒为 0，只能靠时间口径，不能停在 0%。
+    rec.clear()
+    _jr._emit(0, 1,
+              Job(a, os.path.join(tmp, "audio_probe.m4a"), [], duration=20.0, total_frames=0),
+              {"out_time": 10.0, "speed": "", "fps": "", "frame": "0", "frame_num": 0,
+               "size": "", "started": time.time()}, "running")
+    check("纯音频提取：无视频帧时按时间推进 → 50%",
+          rec and abs(rec[-1].percent - 50.0) < 0.01,
+          f"{rec[-1].percent:.1f}%" if rec else "无回调")
+
+    # 回归点 3：ffmpeg 报告 progress=end 时必须收到 100%，
+    #           否则进度条会在最后几帧停住。
+    rec.clear()
+    _jr._emit(0, 1,
+              Job(a, os.path.join(tmp, "end_probe.mp4"), [], duration=4.0, total_frames=120),
+              {"out_time": 3.9, "speed": "", "fps": "", "frame": "115", "frame_num": 115,
+               "size": "", "started": time.time()}, "done")
+    check("progress=end 时进度直接置 100%",
+          rec and abs(rec[-1].percent - 100.0) < 0.01,
+          f"{rec[-1].percent:.1f}%" if rec else "无回调")
+
+    # 回归点 4：进度只能前进，某项指标抖动不得让进度条回退。
+    rec.clear()
+    _holder = {"out_time": 8.0, "speed": "", "fps": "", "frame": "240", "frame_num": 240,
+               "size": "", "started": time.time(), "pct": 0.0}
+    _job = Job(a, os.path.join(tmp, "mono_probe.mp4"), [], duration=10.0, total_frames=300)
+    _jr._emit(0, 1, _job, _holder, "running")      # 80%
+    _holder["out_time"], _holder["frame_num"] = 2.0, 60   # 人为回退
+    _jr._emit(0, 1, _job, _holder, "running")
+    check("进度不回退：指标抖动后仍保持 80%",
+          len(rec) == 2 and abs(rec[-1].percent - 80.0) < 0.01,
           f"{rec[-1].percent:.1f}%" if rec else "无回调")
 
     # ---- 13. 布局检查：同一格子（列区间相交）里不能有两个控件 ----

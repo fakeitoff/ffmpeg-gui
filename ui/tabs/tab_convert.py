@@ -172,6 +172,17 @@ class ConvertTab(BaseTab):
         text = next((t for (lo, hi), t in CRF_DESC.items() if lo <= v <= hi), "")
         self.crf_hint.configure(text=f"CRF {v} · {text}")
 
+    # -- 进度预估 ---------------------------------------------------------
+    def expected_frames(self, src: str) -> int:
+        """纯音频输出没有视频帧；GIF 会降帧率，两者都不能沿用源文件帧数。"""
+        if self.kind.get() == "audio":
+            return 0
+        if _key(self.fmt.get()) == "gif":
+            n = self.frames_from_fps(self.expected_duration(src), self.gif_fps.get())
+            if n > 0:
+                return n
+        return super().expected_frames(src)
+
     # ------------------------------------------------------------------
     def on_src_changed(self):
         self._update_crf_hint()

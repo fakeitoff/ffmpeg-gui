@@ -346,6 +346,13 @@ class MergeTab(BaseTab):
                     src_all += info.duration if info else 0.0
                 if src_all > 0:
                     total = int(round(total * dur_all / src_all))
+        # 重新编码且统一了帧率时，实际总帧数 = 输出时长 × 目标帧率
+        if self.join_mode.get() == "reencode":
+            fps = self._target_fps(self.app.get_info(sources[0]) if sources else None)
+            if fps:
+                n = self.frames_from_fps(self.expected_duration(src), fps)
+                if n > 0:
+                    total = n
         return total
 
     def aux_files(self) -> list[str]:

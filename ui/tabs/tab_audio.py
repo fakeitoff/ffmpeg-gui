@@ -159,6 +159,16 @@ class AudioTab(BaseTab):
         return "_audio" if self.mode.get() == "extract" else "_" + self.mode.get()
 
     # ------------------------------------------------------------------
+    # -- 进度预估 ---------------------------------------------------------
+    def expected_frames(self, src: str) -> int:
+        """提取音频时输出没有视频流，帧数必须报 0，否则进度条会卡在 0%。
+
+        其他模式（替换 / 混音 / 合并）都保留原视频流（-c:v copy），帧数不变。
+        """
+        if self.mode.get() == "extract":
+            return 0
+        return super().expected_frames(src)
+
     def _audio_filters(self) -> str:
         chain = []
         # 音量

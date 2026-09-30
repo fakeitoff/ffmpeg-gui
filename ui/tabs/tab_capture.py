@@ -199,6 +199,65 @@ class CaptureTab(BaseTab):
                     return f"{name}必须是大于 0 的整数。"
         return None
 
+    # -- 进度预估 ---------------------------------------------------------
+    def _int_or(self, value, default: int) -> int:
+        try:
+            return int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return default
+
+    def expected_duration(self, src: str) -> float | None:
+        """各模式的实际处理范围，不能一律用源文件总时长。"""
+        key = self._mode_key()
+        if key == "gif":
+            d = parse_time(self.gif_dur.get())
+            return d if d and d > 0 else None
+        if key == "frame":
+            # 单帧输出：进度基本瞬时完成，给一个极小时长即可
+            return 0.001
+        if key == "tile":
+            return None
+        if key == "seq":
+            return None
+        # frames：仍要读完整个源文件，按源时长推进
+        return super().expected_duration(src)
+
+    def expected_frames(self, src: str) -> int:
+        """按各模式实际输出的画面数量预估，否则进度条会卡住。"""
+        key = self._mode_key()
+        if key in ("frame", "tile"):
+            return 1
+        if key == "gif":
+            n = self.frames_from_fps(self.expected_duration(src), self.gif_fps.get())
+            return n
+        if key == "frames":
+            total = self.src_duration()
+            try:
+                interval = float(self.interval.get())
+            except ValueError:
+                interval = 10.0
+            if total <= 0 or interval <= 0:
+                return 0
+            count = max(1, int(total / interval))
+            limit = self._int_or(self.max_count.get(), 0)
+            if limit > 0:
+                count = min(count, limit)
+            return count
+        if key == "seq":
+            return self._count_sequence_files()
+        return super().expected_frames(src)
+
+    def _count_sequence_files(self) -> int:
+        """统计图片序列模板实际匹配到多少个文件（用于按帧显示进度）。"""
+        pattern = self.seq_pattern.get().strip()
+        if not pattern:
+            return 0
+        import glob as _glob
+        try:
+            return len(_glob.glob(pattern))
+        except Exception:
+            return 0
+
     # ------------------------------------------------------------------
     def build_cmd(self, src: str, dst: str) -> list[str]:
         key = self._mode_key()
