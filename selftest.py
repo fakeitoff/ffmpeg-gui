@@ -10,12 +10,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 from core.probe import locate, probe                      # noqa: E402
-from core.runner import Job, Progress                     # noqa: E402
+from core.runner import Job, JobRunner, Progress          # noqa: E402
 from core.util import local_temp_dir, popen_kwargs        # noqa: E402
 
 results: list[tuple[str, bool, str]] = []
@@ -257,6 +258,10 @@ def main():
     got_dur = t.expected_duration(a)
     check("拼接预期时长 = 各段之和", bool(got_dur) and abs(got_dur - exp_dur) < 0.05,
           f"{got_dur:.2f}s vs {exp_dur:.2f}s")
+    exp_frames = (app.get_info(a).video_frames or 0) + (app.get_info(b).video_frames or 0)
+    got_frames = t.expected_frames(a)
+    check("拼接预期帧数 = 各段帧数之和", got_frames > 0 and abs(got_frames - exp_frames) <= 1,
+          f"{got_frames} vs {exp_frames}")
 
     # 命令行预览稳定性 + 临时文件策略
     t.operation.set("首尾拼接 · 把多个视频接成一段")
@@ -446,6 +451,26 @@ def main():
     check("时长未知：显示「处理中」", app.percent_text.get() == "处理中", app.percent_text.get())
     app._reset_progress()
     check("重置后回到确定模式", str(app.progress.cget("mode")) == "determinate")
+
+    # 按实际处理帧数算进度的计算逻辑（直接验证 _emit）
+    rec = []
+    _jr = JobRunner([], ffmpeg, on_progress=lambda p: rec.append(p))
+    _jr._emit(0, 1,
+              Job(a, os.path.join(tmp, "frame_probe.mp4"), [], duration=10.0, total_frames=100),
+              {"out_time": 5.0, "speed": "", "fps": "", "frame": "50", "frame_num": 50,
+               "size": "", "started": time.time()}, "running")
+    check("按帧算进度：50/100 帧 → 50%", rec and abs(rec[-1].percent - 50.0) < 0.01,
+          f"{rec[-1].percent:.1f}%" if rec else "无回调")
+    check("Progress 携带帧数信息", rec and rec[-1].frame_num == 50 and rec[-1].total_frames == 100,
+          f"{rec[-1].frame_num}/{rec[-1].total_frames}" if rec else "")
+    # 帧数未知时退回按时间估算
+    rec.clear()
+    _jr._emit(0, 1,
+              Job(a, os.path.join(tmp, "t.mp4"), [], duration=10.0, total_frames=0),
+              {"out_time": 5.0, "speed": "", "fps": "", "frame": "0", "frame_num": 0,
+               "size": "", "started": time.time()}, "running")
+    check("帧数未知时退回按时间估算：5s/10s → 50%", rec and abs(rec[-1].percent - 50.0) < 0.01,
+          f"{rec[-1].percent:.1f}%" if rec else "无回调")
 
     # ---- 13. 布局检查：同一格子（列区间相交）里不能有两个控件 ----
     # 回归点：自定义命令页曾手工推算 grid 行号，导致「常用参数片段」按钮网格

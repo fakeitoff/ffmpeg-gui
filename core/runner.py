@@ -23,7 +23,8 @@ class Job:
     src: str
     dst: str
     args: list[str]          # 不含 ffmpeg 可执行文件与全局参数，含 -i 与输出文件
-    duration: float = 0.0    # 源文件时长（秒），用于计算进度
+    duration: float = 0.0    # 源文件时长（秒），用于按时间估算进度
+    total_frames: int = 0    # 视频总帧数，用于按实际处理帧数算进度（优先）
     label: str = ""
     aux_files: list[str] = field(default_factory=list)   # 任务结束后需要清理的辅助文件
 
@@ -46,9 +47,11 @@ class Progress:
     fps: str = ""
     size: str = ""
     frame: str = ""
+    frame_num: int = 0        # 已处理帧数（用于按帧算进度与展示）
+    total_frames: int = 0     # 总帧数
     state: str = "idle"      # idle / running / done / error / cancelled
     elapsed: float = 0.0     # 本任务已运行秒数
-    has_duration: bool = True   # 是否知道预期总时长（否则无法算百分比）
+    has_duration: bool = True   # 是否具备计算百分比的基础（帧数或时长）
 
 
 class JobRunner(threading.Thread):
@@ -146,8 +149,8 @@ class JobRunner(threading.Thread):
 
         errors: list[str] = []
         progress_holder = {
-            "out_time": 0.0, "speed": "", "fps": "", "frame": "", "size": "",
-            "started": time.time(),
+            "out_time": 0.0, "speed": "", "fps": "", "frame": "", "frame_num": 0,
+            "size": "", "started": time.time(),
         }
 
         def pump_stderr():
@@ -194,6 +197,10 @@ class JobRunner(threading.Thread):
                         progress_holder["fps"] = val
                     elif key == "frame":
                         progress_holder["frame"] = val
+                        try:
+                            progress_holder["frame_num"] = int(val)
+                        except ValueError:
+                            pass
                     elif key == "total_size":
                         try:
                             from .util import human_size
@@ -249,9 +256,17 @@ class JobRunner(threading.Thread):
                 pass
 
     def _emit(self, index, total, job, holder, state):
+        total_frames = job.total_frames or 0
         duration = job.duration or 0.0
         out_time = holder["out_time"]
-        pct = min(100.0, (out_time / duration) * 100.0) if duration > 0 else 0.0
+        frame_num = holder.get("frame_num", 0) or 0
+        # 优先按实际处理帧数算百分比，帧数拿不到再退回按时间估算
+        if total_frames > 0:
+            pct = min(100.0, (frame_num / total_frames) * 100.0)
+        elif duration > 0:
+            pct = min(100.0, (out_time / duration) * 100.0)
+        else:
+            pct = 0.0
         overall = ((index + pct / 100.0) / max(1, total)) * 100.0
         p = Progress(
             job_index=index,
@@ -263,8 +278,10 @@ class JobRunner(threading.Thread):
             fps=holder["fps"],
             size=holder["size"],
             frame=holder["frame"],
+            frame_num=frame_num,
+            total_frames=total_frames,
             state=state,
             elapsed=max(0.0, time.time() - holder.get("started", time.time())),
-            has_duration=duration > 0,
+            has_duration=(total_frames > 0 or duration > 0),
         )
         self.on_progress(p)

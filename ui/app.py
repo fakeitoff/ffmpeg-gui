@@ -720,6 +720,7 @@ class App(tk.Tk):
             args = tab.build_cmd(src, dst)
             jobs = [Job(src, dst, args,
                         duration=tab.expected_duration(src) or 0.0,
+                        total_frames=tab.expected_frames(src),
                         aux_files=tab.aux_files())]
             return jobs, None
 
@@ -735,6 +736,7 @@ class App(tk.Tk):
             args = tab.build_cmd(src, dst)
             jobs.append(Job(src, dst, args,
                             duration=tab.expected_duration(src) or 0.0,
+                            total_frames=tab.expected_frames(src),
                             aux_files=tab.aux_files()))
         return jobs, None
 
@@ -774,11 +776,13 @@ class App(tk.Tk):
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
         self._reset_progress()
-        if jobs[0].duration > 0:
+        if jobs[0].total_frames > 0:
             extra = f"（共 {len(jobs)} 个任务）" if len(jobs) > 1 else ""
-            self.log(f"预计输出时长：{format_time(jobs[0].duration)}{extra}", "dim")
+            self.log(f"预计总帧数：{jobs[0].total_frames} 帧{extra}", "dim")
+        elif jobs[0].duration > 0:
+            self.log(f"预计输出时长：{format_time(jobs[0].duration)}", "dim")
         else:
-            self.log("无法确定输出时长，进度条将以「处理中」动画显示", "warn")
+            self.log("无法确定输出规模，进度条将以「处理中」动画显示", "warn")
 
         self.runner = JobRunner(
             jobs,
@@ -873,7 +877,10 @@ class App(tk.Tk):
         parts = []
         if p.job_total > 1:
             parts.append(f"第 {p.job_index + 1}/{p.job_total} 个")
-        parts.append(f"已处理 {format_time(p.out_time, 1)}")
+        if p.total_frames > 0:
+            parts.append(f"帧 {p.frame_num}/{p.total_frames}")
+        else:
+            parts.append(f"已处理 {format_time(p.out_time, 1)}")
         parts.append(f"已用时 {format_time(p.elapsed, 0)}")
         if p.speed:
             parts.append(f"速度 {p.speed}")

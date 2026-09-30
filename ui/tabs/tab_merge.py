@@ -325,6 +325,29 @@ class MergeTab(BaseTab):
             total -= trans * max(0, len(sources) - 1)
         return total if total > 0 else None
 
+    def expected_frames(self, src: str) -> int:
+        """拼接后的总帧数 = 各段帧数之和（转场模式近似按时长比例折减）。"""
+        if self._op_key() != "concat":
+            return super().expected_frames(src)
+        sources = list(self.app.src_files) or [src]
+        total = 0
+        for p in sources:
+            info = self.app.get_info(p)
+            n = info.video_frames if info else 0
+            if n <= 0:
+                return 0
+            total += n
+        if total > 0 and self.join_mode.get() == "reencode" and self.transition_on.get():
+            dur_all = self.expected_duration(src) or 0
+            if dur_all > 0:
+                src_all = 0.0
+                for p in sources:
+                    info = self.app.get_info(p)
+                    src_all += info.duration if info else 0.0
+                if src_all > 0:
+                    total = int(round(total * dur_all / src_all))
+        return total
+
     def aux_files(self) -> list[str]:
         return list(self._aux_files)
 

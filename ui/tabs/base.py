@@ -124,6 +124,15 @@ class BaseTab(ttk.Frame):
         info = self.app.get_info(src)
         return float(info.duration) if info and info.duration else None
 
+    def expected_frames(self, src: str) -> int:
+        """预估本次输出的视频总帧数（用于按实际处理帧数算进度）；0 表示未知。
+
+        默认等于源视频帧数（绝大多数转码 / 滤镜不改变帧数）。
+        会改变帧数的操作（拼接、剪辑、改帧率等）由对应页面覆写。
+        """
+        info = self.app.get_info(src)
+        return info.video_frames if info else 0
+
     def notify_output_changed(self):
         """当输出扩展名等发生变化时通知主窗口刷新命名。"""
         self.app.refresh_auto_output()

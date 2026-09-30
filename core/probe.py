@@ -130,7 +130,7 @@ class StreamInfo:
     __slots__ = (
         "index", "type", "codec", "profile", "width", "height", "fps",
         "sample_rate", "channels", "channel_layout", "bit_rate", "duration",
-        "lang", "title", "pix_fmt", "raw",
+        "lang", "title", "pix_fmt", "nb_frames", "raw",
     )
 
     def __init__(self, raw: dict):
@@ -148,6 +148,7 @@ class StreamInfo:
         self.bit_rate = _to_int(raw.get("bit_rate"))
         self.duration = float(raw.get("duration") or 0.0)
         self.pix_fmt = raw.get("pix_fmt", "")
+        self.nb_frames = _to_int(raw.get("nb_frames"))
         tags = raw.get("tags") or {}
         self.lang = tags.get("language", "")
         self.title = tags.get("title", "")
@@ -218,6 +219,22 @@ class MediaInfo:
             if s.type == "video" and not s.raw.get("disposition", {}).get("attached_pic"):
                 return s
         return None
+
+    @property
+    def video_frames(self) -> int:
+        """视频总帧数（用于按帧计算进度）。
+
+        优先用 ffprobe 报的 ``nb_frames``（精确），没有就用 时长 × 帧率 估算。
+        纯音频/未知返回 0。
+        """
+        v = self.video
+        if v is None:
+            return 0
+        if v.nb_frames and v.nb_frames > 0:
+            return v.nb_frames
+        if v.fps and self.duration:
+            return max(0, int(round(self.duration * float(v.fps))))
+        return 0
 
     @property
     def audio(self) -> StreamInfo | None:
