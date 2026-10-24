@@ -12,10 +12,9 @@ from tkinter import filedialog, messagebox, ttk
 from core import probe as probe_mod
 from core.probe import FFmpegNotFound, locate
 from core.runner import Job, JobRunner, LOG_LEVELS
-from core.util import (build_output_in_dir, build_output_name, cmd_to_string,
-                       ensure_dir, ext_of, format_time, human_size, local_temp_dir,
-                       natural_key, open_in_explorer, purge_dir, purge_stale_temp,
-                       same_file, unique_path)
+from core.util import (build_output_in_dir, build_output_name, ext_of, format_time,
+                       human_size, local_temp_dir, natural_key, open_in_explorer,
+                       purge_dir, purge_stale_temp, same_file)
 from . import theme, widgets
 from .tabs import TAB_CLASSES
 
@@ -125,6 +124,11 @@ class App(tk.Tk):
             version = probe_mod.ffmpeg_version(self.ffmpeg_path)
             self.log(f"已就绪 · {version}", "ok")
             self.log(f"可执行文件：{self.ffmpeg_path}", "dim")
+            if self.ffprobe_path == self.ffmpeg_path:
+                # locate() 找不到 ffprobe 时会退回 ffmpeg：转码照样能跑，
+                # 但读不到时长/帧数，界面信息栏一片空白、进度条只能滚动。
+                self.log("未找到 ffprobe（同目录下的 ffprobe.exe）：媒体信息与进度百分比将不可用，"
+                         "请安装包含 ffprobe 的完整版 ffmpeg。", "warn")
 
         if initial_files:
             self.add_files([f for f in initial_files if os.path.isfile(f)])
@@ -287,6 +291,10 @@ class App(tk.Tk):
         self.out_hint = ttk.Label(out_box, text="", style="PanelMuted.TLabel")
         self.out_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
+        ttk.Checkbutton(out_box, text="覆盖已存在的同名文件（不勾选时遇到同名文件会中止）",
+                        variable=self.overwrite).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         self._on_out_mode()
 
     # ------------------------------------------------------------------
@@ -421,24 +429,31 @@ class App(tk.Tk):
         self._refresh_src_list()
 
     def move_up(self):
-        sel = list(self.src_list.curselection())
-        if not sel or sel[0] == 0:
-            return
-        for i in sel:
-            self.src_files[i - 1], self.src_files[i] = self.src_files[i], self.src_files[i - 1]
-        self._refresh_src_list()
-        for i in sel:
-            self.src_list.selection_set(i - 1)
+        self._move_selected(-1)
 
     def move_down(self):
+        self._move_selected(1)
+
+    def _move_selected(self, delta: int):
+        """把选中的整段向前/向后挪一格，段内顺序保持不变。
+
+        逐个交换会让相邻的多个选中项互相越位（原来 [C,D] 上移变成 [D,C]），
+        所以按移动方向决定遍历顺序：上移从前往后，下移从后往前。
+        """
         sel = list(self.src_list.curselection())
-        if not sel or sel[-1] >= len(self.src_files) - 1:
+        if not sel:
             return
-        for i in reversed(sel):
-            self.src_files[i + 1], self.src_files[i] = self.src_files[i], self.src_files[i + 1]
+        if min(sel) + delta < 0 or max(sel) + delta >= len(self.src_files):
+            return
+        order = sel if delta < 0 else list(reversed(sel))
+        moved = set()
+        for i in order:
+            j = i + delta
+            self.src_files[i], self.src_files[j] = self.src_files[j], self.src_files[i]
+            moved.add(j)
         self._refresh_src_list()
-        for i in sel:
-            self.src_list.selection_set(i + 1)
+        for i in sorted(moved):
+            self.src_list.selection_set(i)
 
     def _refresh_src_list(self):
         self.src_list.delete(0, "end")
@@ -596,8 +611,10 @@ class App(tk.Tk):
                 dst = self.resolve_output(src, tab) if self.src_files else "<输出文件>"
                 try:
                     args = tab.build_cmd(src, dst)
-                    cmd = cmd_to_string([self.ffmpeg_path or "ffmpeg"] + Job(src, dst, args).command(
-                        self.ffmpeg_path or "ffmpeg", self.log_level.get())[1:])
+                    # 预览要跟真实执行一致，包括「是否覆盖同名文件」
+                    cmd = Job(src, dst, args).preview(
+                        self.ffmpeg_path or "ffmpeg", self.log_level.get(),
+                        self.overwrite.get())
                 except Exception as exc:  # noqa: BLE001
                     cmd = f"（参数暂不完整：{exc}）"
             elif tab is not None:
@@ -710,6 +727,8 @@ class App(tk.Tk):
                 head = pattern.split("%")[0]
                 folder = os.path.dirname(os.path.abspath(head)) or os.getcwd()
                 stem = os.path.splitext(os.path.basename(head))[0] or "sequence"
+                # 模板名常以 _ / - 结尾（img_%04d.jpg -> img_），去掉避免拼出 img__video.mp4
+                stem = stem.rstrip("_-") or "sequence"
                 custom_dir = self.out_path.get().strip()
                 if self.out_mode.get() == "custom" and custom_dir and os.path.isdir(custom_dir):
                     folder = custom_dir
@@ -717,6 +736,8 @@ class App(tk.Tk):
             else:
                 dst = self.resolve_output(src, tab)
             dst = tab.resolve_output(src, dst)
+            if same_file(src, dst):
+                return None, f"输出路径与源文件相同，会导致源文件被覆盖：\n{dst}"
             args = tab.build_cmd(src, dst)
             jobs = [Job(src, dst, args,
                         duration=tab.expected_duration(src) or 0.0,
@@ -761,12 +782,24 @@ class App(tk.Tk):
             return
         for job in jobs:
             if os.path.exists(job.dst):
+                # 未勾选覆盖时不能先删再跑：否则「不覆盖」选项形同虚设，
+                # 用户已有的文件会被静默替换掉。
+                if not self.overwrite.get():
+                    messagebox.showerror(
+                        "输出文件已存在",
+                        f"{job.dst}\n\n同名文件已存在。勾选「覆盖已存在的同名文件」后重试，"
+                        "或换一个输出路径。")
+                    return
+                # 勾选了覆盖也不预删除：任务中途失败时用户的原文件会跟着消失。
+                # 只做一次写入探测，把「文件被占用」这种问题在开工前就说清楚。
                 try:
-                    ensure_dir(job.dst)
-                    os.remove(job.dst)
+                    with open(job.dst, "r+b"):
+                        pass
                 except OSError as exc:
                     messagebox.showerror("无法写入输出文件",
-                                         f"{job.dst}\n\n{exc}\n\n请先关闭占用该文件的程序。")
+                                         f"{job.dst}\n\n{exc}\n\n"
+                                         "该文件正被其他程序占用（或设为只读），"
+                                         "请先关闭占用它的程序。")
                     return
 
         self.log_panel.write("─" * 60, "dim")
@@ -825,7 +858,7 @@ class App(tk.Tk):
                     self.status_text.set(
                         f"[{idx + 1}/{self.runner.jobs.__len__()}] 正在处理 {os.path.basename(job.src)}")
                 elif kind == "job_done":
-                    _i, job, ok, msg = event[1], event[2], event[3], event[4]
+                    job, ok, msg = event[2], event[3], event[4]
                     if ok:
                         size = human_size(os.path.getsize(job.dst)) if os.path.exists(job.dst) else "-"
                         self.log(f"✓ 完成：{os.path.basename(job.dst)}  ({size})", "ok")
@@ -891,7 +924,11 @@ class App(tk.Tk):
         self.status_text.set("  ·  ".join(parts))
 
     def _on_finished(self, ok, msg):
-        self.btn_start.configure(state="normal" if (self.current_tab() or self.src_files) else "disabled")
+        # 只看当前页是否可执行：原来写的是 (current_tab() or src_files)，
+        # 而 current_tab() 恒为真值，会把「信息」这类不可执行的页面也点亮开始按钮。
+        tab = self.current_tab()
+        runnable = bool(tab and tab.runnable and not self.startup_error)
+        self.btn_start.configure(state="normal" if runnable else "disabled")
         self.btn_cancel.configure(state="disabled")
         self._reset_progress()
         if ok:
@@ -899,7 +936,10 @@ class App(tk.Tk):
             self.percent_text.set("100%")
             self.log(f"✔ {msg}", "ok")
         else:
-            self.log(f"■ {msg}", "error")
+            # 批量任务现在是「失败也继续跑完」，只要有成功产物就用警告色而不是错误色
+            results = getattr(self.runner, "results", None) or []
+            partial = any(ok_one for _dst, ok_one, _m in results)
+            self.log(f"■ {msg}", "warn" if partial else "error")
         self.status_text.set(msg)
         self._last_preview = ""
         self._flush_log()

@@ -15,7 +15,8 @@ import time
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-from core.probe import locate, probe                      # noqa: E402
+from core import probe as probe_mod                     # noqa: E402
+from core.probe import locate, probe                    # noqa: E402
 from core.runner import Job, JobRunner, Progress          # noqa: E402
 from core.util import local_temp_dir, popen_kwargs        # noqa: E402
 
@@ -29,11 +30,12 @@ def check(label: str, ok: bool, detail: str = ""):
 
 
 def make_samples(ffmpeg: str, folder: str):
-    """生成测试素材：两段小视频、一张图片、一个字幕。"""
+    """生成测试素材：两段小视频、一张图片、一个字幕、一个内嵌 mov_text 字幕的 MP4。"""
     a = os.path.join(folder, "sample_a.mp4")
     b = os.path.join(folder, "sample_b.mp4")
     logo = os.path.join(folder, "logo.png")
     sub = os.path.join(folder, "sample.srt")
+    subbed = os.path.join(folder, "sample_sub.mp4")
 
     src = ("testsrc2=size=640x480:rate=30:duration=4", "sine=frequency=440:duration=4")
     for out, freq in ((a, 440), (b, 660)):
@@ -47,7 +49,13 @@ def make_samples(ffmpeg: str, folder: str):
                     "-frames:v", "1", logo], check=True, **popen_kwargs())
     with open(sub, "w", encoding="utf-8") as fh:
         fh.write("1\n00:00:00,200 --> 00:00:02,500\n测试字幕 Subtitle\n\n")
-    return a, b, logo, sub
+    # 网上下载的 MP4 常见「内嵌 mov_text 字幕」，直接 -c copy 进 MKV 会整批失败，
+    # 专门做一份这种素材来回归字幕流的编码处理。
+    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", a, "-i", sub, "-map", "0", "-map", "1",
+                    "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text", subbed],
+                   check=True, **popen_kwargs())
+    return a, b, logo, sub, subbed
 
 
 def main():
@@ -68,8 +76,9 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="ffgui_test_")
     print(f"测试目录：{tmp}\n")
-    a, b, logo, sub = make_samples(ffmpeg, tmp)
-    check("生成测试素材", os.path.exists(a) and os.path.exists(b) and os.path.exists(logo))
+    a, b, logo, sub, subbed = make_samples(ffmpeg, tmp)
+    check("生成测试素材", os.path.exists(a) and os.path.exists(b) and os.path.exists(logo)
+          and os.path.exists(subbed))
 
     # ---- 构造 GUI（隐藏窗口）----
     from ui.app import App
@@ -120,13 +129,29 @@ def main():
     except Exception as exc:  # noqa: BLE001
         check("单张图片也能算出帧数（包数兜底）", False, str(exc))
 
+    # 能力清单解析：ffmpeg 的 -encoders / -filters 输出前面有一段说明行
+    # （"V..... = Video"、"T.. = Timeline support"），旧解析把它们也当成了条目，
+    # 集合里因此混进 "="；能力判断虽然目前只用于「有没有某个名字」，
+    # 但脏数据会让「列出全部编码器」这类功能一加就出错。
+    from core.probe import available_encoders, available_filters
+
+    enc_set = available_encoders(ffmpeg)
+    flt_set = available_filters(ffmpeg)
+    junk = {x for x in enc_set | flt_set if not x[0].isalpha()}
+    check("编码器/滤镜清单不含说明行脏数据",
+          not junk and "=" not in (enc_set | flt_set),
+          f"脏数据={sorted(junk)[:5]}")
+    check("能力清单仍能识别常用编码器与滤镜",
+          {"libx264", "aac", "gif"} <= enc_set and {"drawtext", "xfade", "tile"} <= flt_set,
+          f"{len(enc_set)} 个编码器 / {len(flt_set)} 个滤镜")
+
     for tab in app.tabs:
         tab.on_src_changed()
 
-    def run(label, tab, out_name, extra_setup=None):
+    def run(label, tab, out_name, extra_setup=None, src=None):
         if extra_setup:
             extra_setup()
-        src = tab.src_override or a
+        src = src or tab.src_override or a
         dst = os.path.join(tmp, out_name)
         try:
             args = tab.build_cmd(src, dst)
@@ -166,6 +191,42 @@ def main():
         lambda: (t.kind.set("audio"), t._on_kind(),
                  t.fmt.set(t.fmt_cb.cget("values")[0])))
 
+    # 回归：MP4 内嵌字幕是 mov_text，MKV 不认它。原来一律 -c copy，
+    # 勾选「保留全部音轨与字幕」转 MKV 会在写头时整批失败。
+    app.src_files = [subbed]
+    app._refresh_src_list()
+    app.info = app.get_info(subbed)
+    for tab in app.tabs:
+        tab.on_src_changed()
+    t = tabs["ConvertTab"]
+    t.kind.set("video")
+    t._on_kind()
+    mkv_value = next(v for v in t.fmt_cb.cget("values") if v.strip().startswith("mkv"))
+    t.fmt.set(mkv_value)
+    t._on_format()
+    t.venc.set("copy  |  直接复制（不重新编码）")
+    t.aenc.set("copy  |  直接复制（不重新编码）")
+    t.keep_all.set(True)
+    keep_dst = os.path.join(tmp, "02b_keepall.mkv")
+    args_ka = t.build_cmd(subbed, keep_dst)
+    check("保留全部流时给 mov_text 字幕指定目标编码",
+          "-c:s:0" in args_ka and "ass" in args_ka, " ".join(args_ka))
+    run("格式转换 保留全部流 → MKV", t, "02b_keepall.mkv", src=subbed)
+    try:
+        ka_info = probe(ffprobe, keep_dst)
+        n_sub = sum(1 for s in ka_info.streams if s.type == "subtitle")
+        check("MKV 里字幕流被保留（转成了 ass）", n_sub == 1,
+              " / ".join(f"#{s.index} {s.type} {s.codec}" for s in ka_info.streams))
+    except Exception as exc:  # noqa: BLE001
+        check("MKV 里字幕流被保留（转成了 ass）", False, str(exc))
+    t.keep_all.set(False)
+    # 后续用例仍以 sample_a 作为主源文件
+    app.src_files = [a, b]
+    app._refresh_src_list()
+    app.info = app.get_info(a)
+    for tab in app.tabs:
+        tab.on_src_changed()
+
     # ---- 2. 压缩 ----
     t = tabs["CompressTab"]
     run("压缩 480p CRF28", t, "03_compress.mp4",
@@ -178,6 +239,40 @@ def main():
                  t.target_mb.set("0.3"), t.resolution.set("640 × 360    (360p)"),
                  t._on_resolution()))
 
+    # 回归：「等比缩放」原来输出的是 scale=W:H，ffmpeg 会把画面强行拉成 W×H，
+    # 与「拉伸」毫无区别（640x480 → 640x360 被压扁）。现在必须保持比例。
+    run("压缩 等比缩放 640×360", t, "04b_fit.mp4",
+        lambda: (t.strategy.set("均衡（CRF 23，推荐）"), t._on_strategy(),
+                 t.resolution.set("640 × 360    (360p)"), t._on_resolution(),
+                 t.scale_mode.set("fit  |  等比缩放（保持比例，尺寸自适应）"),
+                 t.audio_mode.set("copy  |  直接复制")))
+    try:
+        fit_info = probe(ffprobe, os.path.join(tmp, "04b_fit.mp4"))
+        fit_res = f"{fit_info.video.width}x{fit_info.video.height}"
+        # 640x480(4:3) 放进 640x360(16:9) 的框内 → 480x360，且不能等于框的尺寸
+        check("等比缩放保持宽高比（640x480 → 480x360）", fit_res == "480x360", fit_res)
+    except Exception as exc:  # noqa: BLE001
+        check("等比缩放保持宽高比（640x480 → 480x360）", False, str(exc))
+
+    # 回归：目标体积要按**当前文件**的时长算码率。原来读的是第一个文件的
+    # 探测结果，批量时每个文件都被按同一条码率压；探测失败还会静默退回 CRF。
+    saved_info = app.info
+    t.strategy.set("指定目标体积（MB）")
+    t._on_strategy()
+    t.target_mb.set("1")
+    t.audio_mode.set("none  |  移除音频")
+    t._on_audio()
+    app.info = None                       # 模拟第一个文件探测失败
+    br_batch = t._resolve_bitrate(a)      # 4 秒 → 1MB ≈ 2097k
+    check("目标体积按当前文件时长算码率",
+          bool(br_batch) and abs(float(br_batch.rstrip("k")) - 2097.15) < 60,
+          str(br_batch))
+    app.info = saved_info
+    t.strategy.set("均衡（CRF 23，推荐）")
+    t._on_strategy()
+    t.audio_mode.set("copy  |  直接复制")
+    t._on_audio()
+
     # ---- 3. 剪辑 ----
     t = tabs["TrimTab"]
     run("剪辑 1s~3s 精确", t, "05_trim.mp4",
@@ -187,6 +282,24 @@ def main():
     run("剪辑 裁剪+旋转", t, "07_crop.mp4",
         lambda: (t.crop_on.set(True), t.crop_w.set("320"), t.crop_h.set("240"),
                  t.rotation.set("顺时针 90°")))
+
+    # 新增：淡入淡出（画面 + 声音），且淡出位置按**截取后**的片段长度算
+    run("剪辑 1s~3s + 淡入淡出", t, "07b_fade.mp4",
+        lambda: (t.crop_on.set(False), t.rotation.set("不旋转"), t.angle.set("0"),
+                 t.start.set("1"), t.dur.set("2"), t.mode.set("accurate"),
+                 t.fade_in.set("0.5"), t.fade_out.set("0.5")))
+    fade_cmd = " ".join(t.build_cmd(a, os.path.join(tmp, "07b_fade.mp4")))
+    check("淡入淡出同时作用于画面与声音",
+          "fade=t=in" in fade_cmd and "fade=t=out" in fade_cmd
+          and "afade=t=in" in fade_cmd and "afade=t=out" in fade_cmd, fade_cmd[-90:])
+    check("淡出起点按截取后的片段长度算（2 秒片段 - 0.5 秒 = 1.5 秒）",
+          "st=1.5:d=0.5" in fade_cmd, fade_cmd[-90:])
+    t.fade_in.set("3")
+    t.fade_out.set("3")
+    fade_err = t.validate()
+    check("淡入淡出总长超过片段长度会被拦下", bool(fade_err), str(fade_err))
+    t.fade_in.set("")
+    t.fade_out.set("")
 
     # ---- 4. 音频 ----
     t = tabs["AudioTab"]
@@ -199,6 +312,12 @@ def main():
         lambda: (t.mode.set("replace"), t._on_mode(), t.audio_file.set(b)))
     run("音频 混音", t, "11_mix.mp4",
         lambda: (t.mode.set("mix"), t._on_mode(), t.audio_file.set(b), t.bgm_volume.set("0.3")))
+    # amix 默认会把每条输入按比例衰减，混完背景音后原声明显变轻。
+    # 新版 ffmpeg 可关（normalize=0），老版本没这个选项、写了会报错 —— 按能力拼。
+    mix_cmd = " ".join(t.build_cmd(a, os.path.join(tmp, "11b_mix_probe.mp4")))
+    want_norm = probe_mod.filter_has_option(ffmpeg, "amix", "normalize")
+    check("混音按 ffmpeg 版本能力决定是否加 normalize=0",
+          (":normalize=0" in mix_cmd) == want_norm, mix_cmd[:130])
     run("音频 响度标准化", t, "12_loudnorm.mp4",
         lambda: (t.mode.set("extract"), t._on_mode(),
                  t.fmt.set([v for v in t.fmt_cb.cget("values") if v.startswith("m4a")][0]),
@@ -254,6 +373,14 @@ def main():
     run("特效 画中画", t, "16_pip.mp4",
         lambda: (t.operation.set("画中画（视频叠加视频）"), t._on_operation(),
                  t.logo_file.set(b), t.wm_width.set("40")))
+    # 回归：「小窗宽度 40%」是相对**主视频**。原来写成 scale=iw*0.4，
+    # iw 是叠加素材自己的宽度 —— 拿 120px 的图叠 640px 视频只得到 48px 小窗。
+    t.logo_file.set(logo)
+    t.wm_width.set("40")
+    pip_cmd = " ".join(t.build_cmd(a, os.path.join(tmp, "16b_pip_probe.mp4")))
+    check("画中画小窗按主视频宽度缩放（640 的 40% = 256）",
+          "scale=256:-2" in pip_cmd, pip_cmd[pip_cmd.find("-filter_complex"):][:70])
+    t.logo_file.set(b)
     run("特效 硬字幕", t, "17_burnsub.mp4",
         lambda: (t.operation.set("烧录字幕（硬字幕，永久显示）"), t._on_operation(),
                  t.sub_file.set(sub)))
@@ -279,6 +406,18 @@ def main():
     run("合并 多音轨封装 MKV", t, "34_merge_tracks.mkv",
         lambda: (t.operation.set("多音轨封装 · 多个文件的音轨合进一个文件"), t._on_operation(),
                  t.extra_list.set_files([b])))
+    # 回归：界面上写「所有音轨与字幕都会复制进来」，但原来只映射 :a?，
+    # 附加文件里的 .srt/.ass 被静默丢掉。
+    run("合并 多音轨封装（含字幕）", t, "34b_merge_sub.mkv",
+        lambda: t.extra_list.set_files([sub]))
+    try:
+        mt_info = probe(ffprobe, os.path.join(tmp, "34b_merge_sub.mkv"))
+        n_sub = sum(1 for s in mt_info.streams if s.type == "subtitle")
+        check("多音轨封装把附加字幕也带进去了", n_sub == 1,
+              " / ".join(f"#{s.index} {s.type_cn} {s.codec}" for s in mt_info.streams))
+    except Exception as exc:  # noqa: BLE001
+        check("多音轨封装把附加字幕也带进去了", False, str(exc))
+    t.extra_list.clear()
     run("合并 并排同屏(左右)", t, "35_merge_hstack.mp4",
         lambda: (t.operation.set("并排同屏 · 两个视频左右 / 上下同屏"), t._on_operation(),
                  t.side_file.set(b), t.side_layout.set("hstack"),
@@ -382,6 +521,23 @@ def main():
         lambda: (t.mode.set("预览动图（导出 GIF 片段）"), t._on_mode(),
                  t.gif_start.set("0"), t.gif_dur.set("1.5")))
 
+    # 回归：时间填到结尾之后 / 拼图格子多于素材长度时，ffmpeg 一帧都不出，
+    # 用户只能看到「输出文件未生成或为空」，猜不到是参数问题。现在提前拦下。
+    t.mode.set("单张截图（指定时间点抽一帧）")
+    t._on_mode()
+    t.time.set("99")
+    frame_err = t.validate()
+    check("截图时间超出视频长度时提前报错", bool(frame_err) and "超出" in frame_err, str(frame_err))
+    t.time.set("2")
+    t.mode.set("缩略图拼图（一张网格总览图）")
+    t._on_mode()
+    t.tile_cols.set("6")
+    t.tile_rows.set("6")
+    t.interval.set("5")
+    tile_err = t.validate()
+    check("拼图格子多于素材长度时提前报错", bool(tile_err) and "最多只够" in tile_err,
+          str(tile_err))
+
     # ---- 8. 批量截图 ----
     t = tabs["CaptureTab"]
     run("截图 批量(序列输出)", t, "23_shots_%04d.jpg",
@@ -426,6 +582,62 @@ def main():
         while _time.time() < end:
             app.update()
             _time.sleep(0.02)
+
+    # ---- 12a-pre. 批量执行的容错与界面细节 ----
+    # 回归：批量任务里一个文件失败原来会直接中断整批，剩下的文件一个都不处理，
+    # 而日志里只留最后那一条错误。
+    bad = Job(a, os.path.join(tmp, "batch_bad.mp4"),
+              ["-i", os.path.join(tmp, "根本没有这个文件.mp4"),
+               os.path.join(tmp, "batch_bad.mp4")])
+    good = Job(a, os.path.join(tmp, "batch_good.mp4"),
+               ["-i", a, "-c", "copy", os.path.join(tmp, "batch_good.mp4")])
+    finished = []
+    runner = JobRunner([bad, good], ffmpeg, overwrite=True,
+                       on_log=lambda line, kind="info": None,
+                       on_finished=lambda ok, msg: finished.append((ok, msg)))
+    runner.run()
+    check("批量任务：一个失败也继续跑完剩下的",
+          len(runner.results) == 2 and runner.results[-1][1] is True,
+          str([(r[1], r[2][:30]) for r in runner.results]))
+    check("批量任务：汇总里报告失败数量",
+          bool(finished) and finished[0][0] is False and "失败 1" in finished[0][1],
+          finished[0][1] if finished else "")
+
+    # 失败留下的 0 字节产物会被误认为「已经输出了」，必须清掉；有内容的文件不能动
+    empty_out = os.path.join(tmp, "empty_leftover.mp4")
+    with open(empty_out, "wb"):
+        pass
+    JobRunner._drop_empty_output(Job(a, empty_out, []))
+    kept_out = os.path.join(tmp, "kept.mp4")
+    with open(kept_out, "wb") as fh:
+        fh.write(b"x")
+    JobRunner._drop_empty_output(Job(a, kept_out, []))
+    check("失败任务的 0 字节产物被清理，非空文件保留",
+          not os.path.exists(empty_out) and os.path.exists(kept_out))
+
+    # 多选整段移动：选中 C、D 上移应得到 A、C、D、B（逐个交换会把 C、D 顺序换错）
+    app.src_files = [a, b, logo, sub]
+    app._refresh_src_list()
+    app.src_list.selection_clear(0, "end")
+    app.src_list.selection_set(2)
+    app.src_list.selection_set(3)
+    app._move_selected(-1)
+    check("多选整段上移保持段内顺序",
+          app.src_files == [a, logo, sub, b],
+          [os.path.basename(p) for p in app.src_files])
+    app.src_files = [a, b]
+    app._refresh_src_list()
+    app.info = app.get_info(a)
+
+    # 预览必须与真实执行一致：取消勾选「覆盖」时命令里是 -n
+    app.notebook.select(0)
+    app._on_tab_changed()
+    app.overwrite.set(False)
+    app._last_preview = ""
+    app._refresh_preview_text()
+    check("预览随「不覆盖同名文件」切换为 -n", " -n " in app._last_preview,
+          app._last_preview[:70])
+    app.overwrite.set(True)
 
     app.notebook.select(1)              # 压缩 / 画质（会真实重新编码）
     app._on_tab_changed()

@@ -2,7 +2,6 @@
 """操作分支内使用的小表单布局助手（各功能页共用）。"""
 from __future__ import annotations
 
-import tkinter as tk
 from tkinter import ttk
 
 from ..widgets import scaled

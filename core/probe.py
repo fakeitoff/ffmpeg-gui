@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -125,6 +126,31 @@ def _to_int(value, default=0):
         return default
 
 
+def _to_float(value, default=0.0) -> float:
+    """把 ffprobe 字段转成浮点数，未知值一律返回 default。
+
+    ffprobe 对取不到的值会输出字符串 ``"N/A"``（图片流、部分裸流的
+    ``duration`` 很常见），直接 ``float()`` 会抛 ValueError 并让整次探测失败，
+    进而把文件误判成「无法解析」、进度条退化成「处理中」。
+    这里按 ``N/A`` / 空值 / 分数三种情况统一兜底。
+    """
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            text = value.strip()
+            if not text or text.upper() == "N/A":
+                return default
+            if "/" in text:
+                num, den = text.split("/", 1)
+                den_v = float(den)
+                return float(num) / den_v if den_v else default
+            return float(text)
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class StreamInfo:
     """单个流的简化信息。"""
 
@@ -147,7 +173,7 @@ class StreamInfo:
         self.channels = _to_int(raw.get("channels"))
         self.channel_layout = raw.get("channel_layout", "")
         self.bit_rate = _to_int(raw.get("bit_rate"))
-        self.duration = float(raw.get("duration") or 0.0)
+        self.duration = _to_float(raw.get("duration"))
         self.pix_fmt = raw.get("pix_fmt", "")
         self.nb_frames = _to_int(raw.get("nb_frames"))
         # 由 -count_packets 兜底填充（并非所有 ffprobe 输出都带这个字段）
@@ -204,7 +230,7 @@ class MediaInfo:
         fmt = self.raw.get("format") or {}
         self.format_name = (fmt.get("format_name") or "").split(",")[0]
         self.format_long = fmt.get("format_long_name", "")
-        self.duration = float(fmt.get("duration") or 0.0)
+        self.duration = _to_float(fmt.get("duration"))
         self.size = _to_int(fmt.get("size"))
         self.bit_rate = _to_int(fmt.get("bit_rate"))
         self.nb_streams = _to_int(fmt.get("nb_streams"), len(self.raw.get("streams") or []))
@@ -365,6 +391,25 @@ def probe(ffprobe_path: str, path: str, timeout: int = 30) -> MediaInfo:
 # --------------------------------------------------------------------------
 _encoder_cache: set[str] | None = None
 _filter_cache: set[str] | None = None
+# ffprobe/ffmpeg 的清单里，名称只由字母、数字、下划线、连字符组成
+_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+
+
+def _iter_capability_lines(text: str, flag_width: int):
+    """遍历 ``-encoders`` / ``-filters`` 这类「标志列 + 名称」清单。
+
+    说明行（``V..... = Video``、``T.. = Timeline support``）的形状和真正的条目
+    几乎一样，只靠标志列判断会把 ``=`` 当成名字收进集合；因此显式跳过，
+    并要求名称本身就是合法标识符。
+    """
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[1] == "=":
+            continue
+        flags, name = parts[0], parts[1]
+        if len(flags) != flag_width or not _NAME_RE.match(name):
+            continue
+        yield flags, name
 
 
 def available_encoders(ffmpeg_path: str) -> set[str]:
@@ -379,10 +424,9 @@ def available_encoders(ffmpeg_path: str) -> set[str]:
             text=True, encoding="utf-8", errors="replace",
             timeout=30, **popen_kwargs(),
         )
-        for line in (out.stdout or "").splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in "VAS":
-                names.add(parts[1])
+        for flags, name in _iter_capability_lines(out.stdout, 6):
+            if flags[0] in "VAS":
+                names.add(name)
     except Exception:
         pass
     _encoder_cache = names
@@ -390,6 +434,7 @@ def available_encoders(ffmpeg_path: str) -> set[str]:
 
 
 def available_filters(ffmpeg_path: str) -> set[str]:
+    """返回 ffmpeg 支持的滤镜名称集合（结果缓存）。"""
     global _filter_cache
     if _filter_cache is not None:
         return _filter_cache
@@ -400,14 +445,45 @@ def available_filters(ffmpeg_path: str) -> set[str]:
             text=True, encoding="utf-8", errors="replace",
             timeout=30, **popen_kwargs(),
         )
-        for line in (out.stdout or "").splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[0].startswith(("T", ".", "S", "V", "A")):
-                names.add(parts[1])
+        # 滤镜的标志列固定 2 字符（如 ``TS``、``..``、``A.``）
+        for flags, name in _iter_capability_lines(out.stdout, 2):
+            if flags[0] in "TVAS.":
+                names.add(name)
     except Exception:
         pass
     _filter_cache = names
     return names
+
+
+_filter_opt_cache: dict[tuple[str, str], bool] = {}
+
+
+def filter_has_option(ffmpeg_path: str, filt: str, opt: str) -> bool:
+    """判断滤镜是否支持某个选项。
+
+    同一个选项在不同 ffmpeg 版本上的支持情况不同（例如 amix 的
+    ``normalize`` 是较新版本才有的），写上不支持的选项会直接报错，
+    所以要先问一句再决定拼不拼进命令。
+    """
+    key = (filt, opt)
+    if key in _filter_opt_cache:
+        return _filter_opt_cache[key]
+    ok = False
+    try:
+        out = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-h", f"filter={filt}"],
+            text=True, encoding="utf-8", errors="replace",
+            timeout=15, **popen_kwargs(),
+        )
+        for line in (out.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == opt:
+                ok = True
+                break
+    except Exception:
+        pass
+    _filter_opt_cache[key] = ok
+    return ok
 
 
 def pick_font() -> str:

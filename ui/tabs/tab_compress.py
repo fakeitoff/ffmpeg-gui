@@ -199,20 +199,32 @@ class CompressTab(BaseTab):
                 return "目标体积需要填写数字（单位 MB）。"
             if mb <= 0:
                 return "目标体积必须大于 0。"
-            if not self.src_duration():
-                return "无法读取源文件时长，不能按目标体积压缩，请改用码率模式。"
+            # 每个文件都按自己的时长算码率，所以任何一个读不到时长都会静默退回 CRF，
+            # 结果与用户设定的体积目标不符 —— 开工前必须先说清楚。
+            missing = [os.path.basename(p) for p in self.app.src_files
+                       if not (self.app.get_info(p) and self.app.get_info(p).duration)]
+            if missing or not self.app.src_files:
+                names = "、".join(missing[:3]) + ("…" if len(missing) > 3 else "")
+                return ("无法读取时长：" + (names or "所有文件") +
+                        "。请改用「指定视频码率」或 CRF 模式。")
         if self.strategy.get().startswith("指定视频码率"):
             if not self.vbitrate.get().strip():
                 return "请填写视频码率，例如 2000k 或 2M。"
         return None
 
-    def _resolve_bitrate(self) -> str | None:
-        """根据策略返回视频码率字符串（如 ``2000k``），None 表示用 CRF。"""
+    def _resolve_bitrate(self, src: str = "") -> str | None:
+        """根据策略返回视频码率字符串（如 ``2000k``），None 表示用 CRF。
+
+        目标体积模式必须按**当前这个文件**的时长算：批量处理时各文件长度不同，
+        统一用第一个文件的时长会让所有文件都按同一条码率输出，
+        结果有的远超目标体积、有的严重不足。
+        """
         s = self.strategy.get()
         if s.startswith("指定视频码率"):
             return self.vbitrate.get().strip()
         if s.startswith("指定目标体积"):
-            duration = self.src_duration()
+            info = self.app.get_info(src) if src else self.info
+            duration = float(info.duration) if info and info.duration else 0.0
             if not duration or duration <= 0:
                 return None
             try:
@@ -223,8 +235,8 @@ class CompressTab(BaseTab):
             audio_kbps = 0.0
             if not self.audio_mode.get().startswith("none"):
                 if self.audio_mode.get().startswith("copy"):
-                    audio_kbps = (self.info.audio.bit_rate / 1000.0) if (self.info and self.info.audio
-                                                                        and self.info.audio.bit_rate) else 128.0
+                    audio_kbps = (info.audio.bit_rate / 1000.0) if (info and info.audio
+                                                                   and info.audio.bit_rate) else 128.0
                 else:
                     audio_kbps = self._parse_kbps(self.abr.get())
             video_kbps = total_kbps - audio_kbps
@@ -248,7 +260,7 @@ class CompressTab(BaseTab):
     def build_cmd(self, src: str, dst: str) -> list[str]:
         venc = _key(self.venc.get())
         container = _key(self.container.get())
-        bitrate = self._resolve_bitrate()
+        bitrate = self._resolve_bitrate(src)
 
         args: list[str] = []
         if self.hw_accel.get():

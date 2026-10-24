@@ -8,7 +8,6 @@ from tkinter import ttk
 
 from core import builder
 from core.util import format_time, parse_time
-from .. import widgets
 from .base import BaseTab
 from .subform import SubForm as _SubForm
 
@@ -187,16 +186,44 @@ class CaptureTab(BaseTab):
             return None
         if key == "frame":
             try:
-                parse_time(self.time.get())
+                t = parse_time(self.time.get())
             except ValueError as exc:
                 return str(exc)
+            # 超出结尾时 ffmpeg 一帧都取不到，却照样建出 0 字节的图片，
+            # 用户只看到「输出文件未生成或为空」，根本不知道是时间填错了。
+            total = self.src_duration()
+            if t is not None and total and t >= total:
+                return (f"截图时间超出了视频长度：视频只有 {format_time(total, 1)}，"
+                        f"而你要的是 {format_time(t, 1)}。")
+            return None
         if key == "tile":
+            cols = rows = 0
             for name, var in (("列数", self.tile_cols), ("行数", self.tile_rows)):
                 try:
-                    if int(var.get()) < 1:
-                        raise ValueError
+                    value = int(var.get())
                 except ValueError:
                     return f"{name}必须是大于 0 的整数。"
+                if value < 1:
+                    return f"{name}必须是大于 0 的整数。"
+                if name == "列数":
+                    cols = value
+                else:
+                    rows = value
+            try:
+                interval = float(self.interval.get())
+            except ValueError:
+                interval = 10.0
+            if interval <= 0:
+                return "抽取间隔必须大于 0。"
+            # tile 要凑满 列×行 帧才吐出一张图；素材不够时 ffmpeg 直接报
+            # 「Could not open encoder before EOF」，磁盘上什么都不留。
+            total = self.src_duration()
+            need = cols * rows * interval
+            if total and need > total:
+                return (f"拼图需要 {cols}×{rows} = {cols * rows} 格，每格间隔 {interval:g} 秒，"
+                        f"共要 {need:.0f} 秒画面；视频只有 {format_time(total, 1)}，"
+                        f"最多只够 {max(1, int(total / interval))} 格。"
+                        "请缩小网格或缩短抽取间隔。")
         return None
 
     # -- 进度预估 ---------------------------------------------------------
@@ -231,7 +258,10 @@ class CaptureTab(BaseTab):
             n = self.frames_from_fps(self.expected_duration(src), self.gif_fps.get())
             return n
         if key == "frames":
-            total = self.src_duration()
+            # 按**当前这个文件**的时长估算张数：批量处理时各文件长度不同，
+            # 统一用第一个文件的时长会算错（self.src_duration() 就是第一个文件）。
+            info = self.app.get_info(src)
+            total = float(info.duration) if info and info.duration else 0.0
             try:
                 interval = float(self.interval.get())
             except ValueError:
@@ -248,13 +278,21 @@ class CaptureTab(BaseTab):
         return super().expected_frames(src)
 
     def _count_sequence_files(self) -> int:
-        """统计图片序列模板实际匹配到多少个文件（用于按帧显示进度）。"""
+        """统计图片序列模板实际匹配到多少个文件（用于按帧显示进度）。
+
+        ffmpeg 用 ``%04d`` 之类的占位符表示序号，glob 认不出这种写法，
+        直接 glob 会恒返回 0（进度条只能退化成「处理中」动画），
+        所以先把占位符换成通配符再去匹配。
+        """
         pattern = self.seq_pattern.get().strip()
         if not pattern:
             return 0
         import glob as _glob
+        import re as _re
+
+        glob_pattern = _re.sub(r"%0?\d*[di]", "*", pattern)
         try:
-            return len(_glob.glob(pattern))
+            return len(_glob.glob(glob_pattern))
         except Exception:
             return 0
 

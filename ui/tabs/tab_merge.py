@@ -613,8 +613,12 @@ class MergeTab(BaseTab):
             args += ["-i", p]
         args += ["-map", "0"]
         for i in range(1, len(extras) + 1):
-            args += ["-map", f"{i}:a?"]
+            # 界面上写的是「所有音轨与字幕都会复制进来」，字幕确实也得映射，
+            # 否则附加文件的 .srt/.ass 会被静默丢掉。
+            args += ["-map", f"{i}:a?", "-map", f"{i}:s?"]
         args += ["-c", "copy", "-map_metadata", "0"]
+        args += builder.subtitle_codec_args(self.subtitle_codecs(src, *extras),
+                                            self.output_ext())
         if dst.lower().endswith(".mp4"):
             args += ["-movflags", "+faststart"]
         return args + [dst]
@@ -633,8 +637,7 @@ class MergeTab(BaseTab):
         mode = self.side_audio.get()
         args = ["-i", src, "-i", second]
         if mode == "mix":
-            graph += (";[0:a][1:a]amix=inputs=2:duration=longest:"
-                      "dropout_transition=2[aout]")
+            graph += f";[0:a][1:a]{self.amix_args(2, 'longest')}[aout]"
             args += ["-filter_complex", graph, "-map", "[v]", "-map", "[aout]",
                      "-c:a", "aac", "-b:a", "192k"]
         else:

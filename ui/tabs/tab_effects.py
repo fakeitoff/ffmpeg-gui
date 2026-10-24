@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from core import builder
-from core.util import escape_filter_path, local_temp_dir
+from core.util import escape_filter_path, filter_unsafe_chars, local_temp_dir
 from .. import widgets
 from .base import BaseTab
 from .subform import SubForm as _SubForm
@@ -46,6 +46,9 @@ class EffectsTab(BaseTab):
     def build(self):
         self._aux_files: list[str] = []
         self._text_cache: dict[int, str] = {}
+        # 本页面写到 temp/ 下的所有文本文件：行数改少后旧文件不能再留着，
+        # 否则 cleanup 只删当前引用的那几个，剩下的要等下次启动才被回收。
+        self._created_files: set[str] = set()
         f = self.form
 
         self.operation = tk.StringVar(value=OP_LABEL["none"])
@@ -236,12 +239,13 @@ class EffectsTab(BaseTab):
         return list(self._aux_files)
 
     def cleanup(self):
-        for path in self._aux_files:
+        for path in set(self._aux_files) | self._created_files:
             try:
                 os.remove(path)
             except OSError:
                 pass
         self._aux_files = []
+        self._created_files.clear()
         self._text_cache.clear()
 
     def _text_files(self, text: str) -> list[str]:
@@ -261,6 +265,7 @@ class EffectsTab(BaseTab):
                 with open(path, "w", encoding="utf-8", newline="\n") as fh:
                     fh.write(line)
                 self._text_cache[i] = line
+            self._created_files.add(path)
             paths.append(path)
         return paths
 
@@ -308,8 +313,32 @@ class EffectsTab(BaseTab):
         return tail
 
     # ------------------------------------------------------------------
+    def _filter_path_problem(self, op: str) -> str | None:
+        """嵌进滤镜图的路径无法包含单引号，提前用人话提示。
+
+        ``fontfile`` / ``textfile`` / ``subtitles=filename`` 都是滤镜参数，
+        而 ffmpeg 的滤镜引用本身就靠 ``'`` 成对，实测 ``\\'``、``''``、
+        ``'\\''`` 三种写法都不能表示一个引号字符——路径里有 ``'`` 时
+        文件名会被从引号处截断，报错还看不出来是路径的问题。
+        作为输入文件（``-i``）传进去的图片 / 视频 / 字幕不受影响，无需检查。
+        """
+        if op == "text_wm":
+            candidates = [local_temp_dir(), self.app.font_path]
+        elif op == "burn_sub":
+            candidates = [self.sub_file.get().strip()]
+        else:
+            return None
+        for path in candidates:
+            if path and filter_unsafe_chars(path):
+                return (f"路径里含有单引号 ' ，ffmpeg 的滤镜参数无法转义它：\n{path}\n\n"
+                        "请把文件（或本程序所在目录）改到不含单引号的路径再试。")
+        return None
+
     def validate(self):
         op = self._op_key()
+        problem = self._filter_path_problem(op)
+        if problem:
+            return problem
         if op in ("image_wm", "pip"):
             p = self.logo_file.get().strip()
             if not p:
@@ -380,7 +409,14 @@ class EffectsTab(BaseTab):
             args = ["-i", src, "-i", media]
             if op == "pip":
                 pct = max(2, min(100, self._safe_int(self.wm_width.get(), 30))) / 100.0
-                graph = f"[1:v]scale=iw*{pct:.4f}:-2[ov]"
+                # 「小窗宽度」是相对**主视频**的百分比。写成 iw*pct 会按叠加素材
+                # 自己的宽度缩放（1080p 的视频叠一张 200px 截图，40% 只有 80px），
+                # 画面大小完全对不上界面说明。
+                main_w = self.info.video.width if (self.info and self.info.video) else 0
+                if main_w:
+                    graph = f"[1:v]scale={max(16, int(main_w * pct) // 2 * 2)}:-2[ov]"
+                else:
+                    graph = f"[1:v]scale=iw*{pct:.4f}:-2[ov]"
                 pos = builder.overlay_position(self.overlay_pos.get(),
                                                self._safe_int(self.overlay_margin.get(), 20))
                 overlay_opts = f"{pos}:shortest=1"
@@ -407,8 +443,14 @@ class EffectsTab(BaseTab):
         if op == "soft_sub":
             sub = self.sub_file.get().strip()
             container = self.output_ext()
-            codec = "mov_text" if container in ("mp4", "mov", "m4v") else "srt"
-            args = ["-i", src, "-i", sub, "-map", "0", "-map", "1", "-c", "copy", "-c:s", codec]
+            # 新增的字幕永远排在已有字幕之后，所以 -c:s 的序号顺序 = 源文件字幕 + 这个文件
+            added = ("ass" if sub.lower().endswith((".ass", ".ssa")) else
+                     "webvtt" if sub.lower().endswith(".vtt") else "srt")
+            codecs = self.subtitle_codecs(src) + [added]
+            args = ["-i", src, "-i", sub, "-map", "0", "-map", "1", "-c", "copy"]
+            # 统一 -c:s srt 会把源文件里的 PGS 等图形字幕也强转成文本字幕而报错；
+            # 按流逐个指定，能原样复制的一律不动。
+            args += builder.subtitle_codec_args(codecs, container)
             if container in ("mp4", "mov", "m4v"):
                 args += ["-movflags", "+faststart"]
             return args + [dst]

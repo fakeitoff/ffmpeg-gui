@@ -169,7 +169,12 @@ class AudioTab(BaseTab):
             return 0
         return super().expected_frames(src)
 
-    def _audio_filters(self) -> str:
+    def _audio_filters(self, src: str = "") -> str:
+        """拼出音频滤镜链。
+
+        ``src`` 传入当前正在处理的文件：淡出起点要按**这个文件**的时长算，
+        批量处理时各文件长度不同，统一用第一个文件会把淡出位置算错。
+        """
         chain = []
         # 音量
         try:
@@ -208,7 +213,12 @@ class AudioTab(BaseTab):
         if fin > 0:
             chain.append(f"afade=t=in:st=0:d={fin:g}")
         if fout > 0:
-            total = self.src_duration()
+            total = 0.0
+            if src:
+                info = self.app.get_info(src)
+                total = float(info.duration) if info and info.duration else 0.0
+            if not total:
+                total = self.src_duration()
             st = max(0.0, total - fout) if total else 0
             chain.append(f"afade=t=out:st={st:.3f}:d={fout:g}")
         # 响度标准化
@@ -252,7 +262,7 @@ class AudioTab(BaseTab):
 
     def build_cmd(self, src: str, dst: str) -> list[str]:
         mode = self.mode.get()
-        af = self._audio_filters()
+        af = self._audio_filters(src)
         enc_args = self._encode_args()
 
         if mode == "extract":
@@ -290,7 +300,7 @@ class AudioTab(BaseTab):
             bg_vol = float(self.bgm_volume.get())
         except ValueError:
             bg_vol = 0.3
-        fc = f"[1:a]volume={bg_vol:g}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2"
+        fc = f"[1:a]volume={bg_vol:g}[bg];[0:a][bg]{self.amix_args(2, 'first')}"
         if af:
             fc += f"[mix];[mix]{af}[aout]"
         else:

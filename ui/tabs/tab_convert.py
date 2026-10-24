@@ -194,8 +194,8 @@ class ConvertTab(BaseTab):
     def validate(self):
         if self.kind.get() == "audio" and self.info and not self.info.has_audio:
             return "源文件不包含音频流，无法提取为纯音频格式。"
-        if _key(self.fmt.get()) == "gif" and self.kind.get() == "video":
-            pass
+        if self.kind.get() == "video" and self.info and not self.info.has_video:
+            return "源文件不包含视频流。若要提取声音，请把输出类型改为「纯音频」。"
         return None
 
     def build_cmd(self, src: str, dst: str) -> list[str]:
@@ -226,6 +226,10 @@ class ConvertTab(BaseTab):
             args += ["-map", "0", "-c", "copy"]
             args += builder.video_encode_args(venc, crf=self.crf.get(), preset=self.preset.get())
             args += builder.audio_encode_args(aenc, bitrate=self.abr.get().strip() or None)
+            # 字幕流：容器对字幕编码的限制差别很大 —— MP4 只认 mov_text，
+            # MKV 恰恰不认 mov_text（网上下载的 MP4 内嵌字幕就是它）。
+            # 一律 -c copy 会在写头时整批失败，所以按流逐个指定目标编码。
+            args += builder.subtitle_codec_args(self.subtitle_codecs(src), container)
         else:
             args += builder.video_encode_args(venc, crf=self.crf.get(), preset=self.preset.get())
             args += builder.audio_encode_args(aenc, bitrate=self.abr.get().strip() or None)

@@ -2,8 +2,6 @@
 """命令片段构建：编码器、滤镜链等复用逻辑。"""
 from __future__ import annotations
 
-from .util import escape_filter_path, escape_filter_value
-
 # --------------------------------------------------------------------------
 # 编码器
 # --------------------------------------------------------------------------
@@ -126,6 +124,10 @@ def video_encode_args(encoder: str, **kw) -> list[str]:
             args += ["-b:v", str(bitrate)]
         elif crf is not None:
             args += ["-crf", str(crf)]
+            if encoder in ("libvpx-vp9", "libaom-av1"):
+                # VP9 / libaom 只有在目标码率为 0 时才走真正的恒定质量（CRF）模式，
+                # 否则 -crf 只是给码率控制加了个质量上限，画质档位等于没生效。
+                args += ["-b:v", "0"]
         if preset:
             if encoder in ("libx264", "libx265"):
                 args += ["-preset", preset]
@@ -192,6 +194,39 @@ def quality_args(crf: int) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# 字幕流
+# --------------------------------------------------------------------------
+# 文本类字幕（可以互相转码）；其余是图形字幕（PGS / VobSub 等），无法转成文本字幕。
+TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "vtt",
+                   "text", "tt", "eia_608", "dvb_teletext", "libzvbi_teletext"}
+
+# 各容器接受的字幕编码差别很大，原样 copy 常见后果是写头时整体失败：
+#   MP4 / MOV   只认 mov_text（TS/文本字幕都会被拒）
+#   MKV         认 ass / srt / webvtt / PGS，但**不认 mov_text**（网上下载的 MP4 内嵌字幕就是它）
+#   WebM        只认 webvtt
+
+
+def subtitle_codec_args(codecs, container: str) -> list[str]:
+    """按输出容器给每条字幕流指定编码器。
+
+    ``codecs`` 是**映射顺序**下各字幕流的编码名（来自 ffprobe）。
+    逐条用 ``-c:s:<序号>`` 指定，这样图形字幕仍能直接 copy ——
+    统一写 ``-c:s ass`` 会让 PGS 之类无法转换的流整批失败。
+    MKV 里只有 mov_text 需要转成 ass，其余保持原编码（省略参数即沿用 -c copy）。
+    """
+    args: list[str] = []
+    for i, raw in enumerate(codecs or []):
+        codec = str(raw or "").lower()
+        if container in ("mp4", "mov", "m4v"):
+            args += [f"-c:s:{i}", "mov_text"]
+        elif container in ("mkv", "mka") and codec == "mov_text":
+            args += [f"-c:s:{i}", "ass"]
+        elif container == "webm" and codec in TEXT_SUB_CODECS:
+            args += [f"-c:s:{i}", "webvtt"]
+    return args
+
+
+# --------------------------------------------------------------------------
 # 滤镜
 # --------------------------------------------------------------------------
 def scale_filter(width=None, height=None, mode="fit", pad_color="black") -> str:
@@ -211,6 +246,10 @@ def scale_filter(width=None, height=None, mode="fit", pad_color="black") -> str:
     if mode == "stretch" and width and height:
         return f"scale={width}:{height}"
     if mode == "fit":
+        # scale=W:H 会把画面强行拉成 W×H（比例失真）；只有加了
+        # force_original_aspect_ratio=decrease 才是「等比缩放到框内」。
+        if width and height:
+            return f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos"
         return f"scale={w}:{h}:flags=lanczos"
     if width and height:
         if mode == "pad":
@@ -227,7 +266,7 @@ def scale_filter(width=None, height=None, mode="fit", pad_color="black") -> str:
 
 
 def atempo_chain(speed: float) -> str:
-    """atenpo 单次只支持 0.5~2.0，超出时串联。"""
+    """atempo 单次只支持 0.5~2.0，超出时串联。"""
     if speed <= 0:
         speed = 1.0
     parts = []

@@ -182,7 +182,10 @@ def open_in_explorer(path: str):
         else:
             subprocess.Popen(["explorer", "/select,", path])
     elif sys.platform == "darwin":
-        subprocess.Popen(["open", "-R" if os.path.isfile(path) else "", path])
+        if os.path.isfile(path):
+            subprocess.Popen(["open", "-R", path])
+        else:
+            subprocess.Popen(["open", path])
     else:
         target = path if os.path.isdir(path) else os.path.dirname(path)
         subprocess.Popen(["xdg-open", target])
@@ -194,8 +197,13 @@ def open_in_explorer(path: str):
 def escape_filter_value(value: str) -> str:
     """转义 ffmpeg 滤镜图中的取值。
 
-    需要转义的字符：``\\ ' : , ; [ ] =``。运行时不经过 shell，
+    需要转义的字符：``\\ " : , ; [ ] =``。运行时不经过 shell，
     因此只需处理 ffmpeg 自身的滤镜解析规则。
+
+    注意单引号 ``'`` 无法转义：滤镜参数本身就是用 ``'...'`` 包起来的，
+    实测 ``\\'``、``''``、``'\\''`` 三种写法都不能让 ``'`` 出现在值里
+    （ffmpeg 会在 ``'`` 处提前结束引用）。含单引号的路径必须绕开滤镜，
+    用 :func:`filter_unsafe_chars` 在开工前给出明确提示。
     """
     out = []
     for ch in str(value):
@@ -203,6 +211,11 @@ def escape_filter_value(value: str) -> str:
             out.append("\\")
         out.append(ch)
     return "".join(out)
+
+
+def filter_unsafe_chars(path: str) -> str:
+    """返回路径中会让滤镜参数解析错位的字符（目前只有单引号），没有则返回空串。"""
+    return "'" if "'" in str(path) else ""
 
 
 def escape_filter_path(path: str) -> str:
@@ -353,19 +366,18 @@ def purge_stale_temp(max_age_hours: float = 24.0) -> int:
     cutoff_paths += [p for p in glob.glob(legacy_dir)
                      if _TEMP_LEGACY_RE.match(os.path.basename(p))]
 
+    import shutil
     import time
 
     cutoff = time.time() - max_age_hours * 3600.0
     removed = 0
     for path in set(cutoff_paths):
-        if _TEMP_LEGACY_RE.match(os.path.basename(path)):
-            pass                                  # 旧随机名文件：当前版本不会再生成
-        elif os.path.getmtime(path) > cutoff:
-            continue
         try:
+            # 旧随机名文件：当前版本不会再生成，不论新旧一律回收
+            if not _TEMP_LEGACY_RE.match(os.path.basename(path)):
+                if os.path.getmtime(path) > cutoff:
+                    continue
             if os.path.isdir(path):
-                import shutil
-
                 shutil.rmtree(path, ignore_errors=True)
             else:
                 os.remove(path)

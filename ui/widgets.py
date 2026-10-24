@@ -395,24 +395,27 @@ class FileListBox(ttk.Frame):
         self._refresh()
 
     def move_up(self):
-        sel = list(self.listbox.curselection())
-        if not sel or sel[0] == 0:
-            return
-        for i in sel:
-            self._files[i - 1], self._files[i] = self._files[i], self._files[i - 1]
-        self._refresh()
-        for i in sel:
-            self.listbox.selection_set(i - 1)
+        self._move_selected(-1)
 
     def move_down(self):
+        self._move_selected(1)
+
+    def _move_selected(self, delta: int):
+        """整段移动且保持段内顺序（逐个交换会让相邻选中项互相越位）。"""
         sel = list(self.listbox.curselection())
-        if not sel or sel[-1] >= len(self._files) - 1:
+        if not sel:
             return
-        for i in reversed(sel):
-            self._files[i + 1], self._files[i] = self._files[i], self._files[i + 1]
+        if min(sel) + delta < 0 or max(sel) + delta >= len(self._files):
+            return
+        order = sel if delta < 0 else list(reversed(sel))
+        moved = set()
+        for i in order:
+            j = i + delta
+            self._files[i], self._files[j] = self._files[j], self._files[i]
+            moved.add(j)
         self._refresh()
-        for i in sel:
-            self.listbox.selection_set(i + 1)
+        for i in sorted(moved):
+            self.listbox.selection_set(i)
 
     def _refresh(self):
         self.listbox.delete(0, "end")

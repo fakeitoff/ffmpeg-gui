@@ -32,8 +32,9 @@ class Job:
         flag = "-y" if overwrite else "-n"
         return [ffmpeg_path] + GLOBAL_ARGS + [flag, "-loglevel", loglevel] + self.args
 
-    def preview(self, ffmpeg_path: str = "ffmpeg", loglevel: str = "info") -> str:
-        return cmd_to_string(self.command(ffmpeg_path, loglevel))
+    def preview(self, ffmpeg_path: str = "ffmpeg", loglevel: str = "info",
+                overwrite: bool = True) -> str:
+        return cmd_to_string(self.command(ffmpeg_path, loglevel, overwrite))
 
 
 @dataclass
@@ -109,25 +110,42 @@ class JobRunner(threading.Thread):
     # -- 主流程 -----------------------------------------------------------
     def run(self):
         total = len(self.jobs)
-        ok_all = True
-        message = ""
+        cancelled = False
         for i, job in enumerate(self.jobs):
             if self._stop_event.is_set():
-                ok_all = False
-                message = "已取消"
+                cancelled = True
                 break
             self.on_job_start(i, job)
             ok, msg = self._run_one(i, total, job)
             self.results.append((job.dst, ok, msg))
             self.on_job_done(i, job, ok, msg)
-            if not ok:
-                ok_all = False
-                if self._stop_event.is_set():
-                    message = "已取消"
-                    break
-                message = msg
+            if not ok and self._stop_event.is_set():
+                cancelled = True
                 break
-        if ok_all:
+        # 辅助文件（拼接清单 / 水印文本）在所有任务跑完后统一清理。
+        # 批量处理时多个任务引用的是同一批辅助文件，若每个任务结束就删，
+        # 后面的任务会因找不到文件而失败。
+        for job in self.jobs:
+            self._drop_aux(job)
+
+        done = sum(1 for _dst, ok, _msg in self.results if ok)
+        failed = len(self.results) - done
+        if cancelled:
+            ok_all = False
+            left = total - len(self.results)
+            message = f"已取消：成功 {done} 个"
+            if left:
+                message += f"，未处理 {left} 个"
+            if failed:
+                message += f"，失败 {failed} 个"
+        elif failed:
+            # 批量任务里一个文件失败不该中断整批：继续跑完剩下的，最后汇总。
+            ok_all = False
+            bad = [os.path.basename(dst) for dst, ok, _m in self.results if not ok]
+            names = "、".join(bad[:3]) + ("…" if len(bad) > 3 else "")
+            message = f"成功 {done} 个，失败 {failed} 个：{names}"
+        else:
+            ok_all = True
             message = f"全部完成（{total} 个任务）" if total > 1 else "完成"
         self.on_finished(ok_all, message)
 
@@ -233,18 +251,55 @@ class JobRunner(threading.Thread):
                     os.remove(job.dst)
             except OSError:
                 pass
-            self._drop_aux(job)
             return False, "已取消"
 
         if rc != 0:
+            self._drop_empty_output(job)
             detail = errors[-1] if errors else f"ffmpeg 退出码 {rc}"
-            self._drop_aux(job)
             return False, detail
 
-        self._drop_aux(job)
-        if not os.path.exists(job.dst) or os.path.getsize(job.dst) == 0:
+        if not self._output_ok(job, progress_holder.get("started", 0.0)):
+            self._drop_empty_output(job)
             return False, "输出文件未生成或为空"
         return True, "完成"
+
+    @staticmethod
+    def _drop_empty_output(job: Job):
+        """失败任务留下的 0 字节文件要清掉，否则用户会以为已经输出了。"""
+        try:
+            if os.path.isfile(job.dst) and os.path.getsize(job.dst) == 0:
+                os.remove(job.dst)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _output_ok(job: Job, since: float = 0.0) -> bool:
+        """判断任务是否真的产出了文件。
+
+        批量截图等模式的输出路径是含 ``%04d`` 的模板，磁盘上不存在同名文件，
+        直接 ``os.path.exists`` 恒为 False，会被误判成「输出文件未生成或为空」
+        并中断后续任务。这里先把占位符换成通配符再匹配实际产物
+        （``_0001.jpg``、``_0002.jpg`` ……）。
+
+        ``since`` 为本任务启动时刻：只统计该时刻之后生成的文件，
+        避免把上一次运行残留的同名图片当成本次的成功产出。
+        """
+        dst = job.dst
+        if os.path.exists(dst):
+            return os.path.getsize(dst) > 0
+        if "%" not in dst:
+            return False
+        import glob
+        import re
+
+        pattern = re.sub(r"%0?\d*[di]", "*", dst)
+        try:
+            matches = [p for p in glob.glob(pattern) if os.path.isfile(p)]
+        except Exception:
+            return False
+        if since:
+            matches = [p for p in matches if os.path.getmtime(p) >= since - 1.0]
+        return any(os.path.getsize(p) > 0 for p in matches)
 
     @staticmethod
     def _drop_aux(job: Job):

@@ -2,8 +2,9 @@
 """功能页基类。"""
 from __future__ import annotations
 
-import tkinter as tk
 from tkinter import ttk
+
+from core import probe
 
 from ..widgets import Form, ScrollFrame, scaled
 
@@ -111,6 +112,22 @@ class BaseTab(ttk.Frame):
     def has_audio(self) -> bool:
         return bool(self.app.info and self.app.info.has_audio)
 
+    def subtitle_codecs(self, *paths) -> list[str]:
+        """按映射顺序返回这些文件里字幕流的编码名；探测不到的按无字幕处理。
+
+        用于给 ``-c:s:<序号>`` 指定目标编码：序号必须与 ffmpeg 实际映射的
+        字幕流顺序一致，所以这里严格按传入文件的顺序展开。
+        """
+        codecs: list[str] = []
+        for path in paths:
+            if not path:
+                continue
+            info = self.app.get_info(path)
+            if info is None:
+                continue
+            codecs += [s.codec for s in info.streams if s.type == "subtitle"]
+        return codecs
+
     def src_duration(self) -> float:
         return float(self.app.info.duration) if self.app.info else 0.0
 
@@ -176,6 +193,18 @@ class BaseTab(ttk.Frame):
         except (TypeError, ValueError):
             return 0.0
         return f if f > 0 else 0.0
+
+    def amix_args(self, inputs: int = 2, duration: str = "first") -> str:
+        """拼 amix 的参数串。
+
+        amix 默认会把每条输入按比例衰减（两条轨各占一半音量），混完背景音乐后
+        原声明显变轻。新版 ffmpeg 有 ``normalize=0`` 可以关掉这个自动衰减，
+        老版本写了这个选项会直接报错，所以按能力判断后再拼进命令。
+        """
+        base = f"amix=inputs={inputs}:duration={duration}:dropout_transition=2"
+        if probe.filter_has_option(self.app.ffmpeg_path, "amix", "normalize"):
+            base += ":normalize=0"
+        return base
 
     def notify_output_changed(self):
         """当输出扩展名等发生变化时通知主窗口刷新命名。"""
