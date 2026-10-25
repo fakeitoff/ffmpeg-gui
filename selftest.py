@@ -87,13 +87,67 @@ def main():
     # ---- 构造 GUI（隐藏窗口）----
     from ui.app import App
 
-    app = App(initial_files=[a, b])
+    # 日志也落在程序 temp/ 的素材目录里，不污染仓库的 log/
+    log_dir = os.path.join(tmp, "log")
+    app = App(initial_files=[a, b], log_dir=log_dir)
     app.withdraw()
     app.update()
 
     app.info = app.get_info(a)
     check("ffprobe 解析源文件", app.info is not None,
           app.info.describe() if app.info else "解析失败")
+
+    # ---- 1b. 运行日志实时落盘（排查问题用的就是它）----
+    def log_text():
+        try:
+            with open(app.run_log.path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError as exc:
+            return f"(读不到日志：{exc})"
+
+    check("启动即建日志文件，并在界面上告诉用户在哪",
+          app.run_log.enabled and os.path.isfile(app.run_log.path)
+          and os.path.normcase(os.path.dirname(app.run_log.path)) == os.path.normcase(log_dir),
+          app.run_log.path)
+    head = log_text()
+    check("日志开头记录环境信息（时间/Python/命令行/ffmpeg 路径与版本）",
+          "启动时间" in head and "命令行" in head and "ffmpeg" in head
+          and "Python" in head, head.splitlines()[1][:90] if len(head.splitlines()) > 1 else head)
+    # 「实时」是本节的重点：不 close、不批量刷，写完就得在文件里
+    marker = f"实时落盘测试 {time.time():.6f}"
+    app.log(marker, "info")
+    check("每条日志立刻能在文件里读到（未 flush 到界面、未关窗）",
+          marker in log_text(), marker)
+    app.log("http://host/x.m3u8?sign=SECRETSIGN&t=9 带签名地址", "cmd")
+    body = log_text()
+    check("在线地址的签名参数落盘前被抹掉",
+          "SECRETSIGN" not in body and "参数已隐藏" in body and "x.m3u8" in body,
+          [ln for ln in body.splitlines() if "x.m3u8" in ln][-1][:110])
+    stale = os.path.join(log_dir, "run-19700101-000000.log")
+    with open(stale, "w", encoding="utf-8") as fh:
+        fh.write("旧日志\n")
+    os.utime(stale, (time.time() - 40 * 86400, time.time() - 40 * 86400))
+    keeper = os.path.join(log_dir, "run-20991231-000000.log")
+    with open(keeper, "w", encoding="utf-8") as fh:
+        fh.write("新日志\n")
+    from core.logfile import RunLog as _RL
+
+    _RL(directory=log_dir)
+    check("旧日志按 30 天自动回收，新的留着（且只认 run-*.log）",
+          not os.path.exists(stale) and os.path.exists(keeper),
+          f"{stale} 已删 / {keeper} 保留")
+    os.remove(keeper)
+
+    # 排障最需要的就是失败当场的 ffmpeg 原话，逐条经 app.log 转写进文件
+    fail_job = Job(a, os.path.join(tmp, "log_fail.mp4"),
+                   ["-i", "missing_asset_for_log.xyz", "-c", "copy"])
+    JobRunner([fail_job], ffmpeg, overwrite=True,
+              on_log=lambda line, kind="info": app.log(line, kind)).run()
+    err_body = log_text()
+    check("真实失败的 ffmpeg 报错原样进日志（命令与报错都在）",
+          "missing_asset_for_log.xyz" in err_body
+          and "No such file" in err_body and "$ " in err_body,
+          [ln for ln in err_body.splitlines() if "No such file" in ln][-1][:110])
 
     # ---- 12a. 探测健壮性：文件名编码与无元数据的媒体 ----
     # 回归点 1：ffprobe 输出 UTF-8 JSON，而 Windows 中文环境默认 GBK。
@@ -728,6 +782,22 @@ def main():
     check("在线地址的输出用地址里最后一段命名，落到指定目录",
           os.path.normcase(os.path.dirname(remote_dst)) == os.path.normcase(dl_dir)
           and os.path.basename(remote_dst) == "index_merged.mkv", remote_dst)
+    # 默认落点 downloads/ 是「不存在就要建出来」的目录：曾经把目录路径传给
+    # ensure_dir（它建的是文件的父目录），结果 downloads/ 从来没被创建过
+    import ui.app as ui_app
+
+    _root_before = ui_app.APP_ROOT
+    ui_app.APP_ROOT = tmp
+    app.out_mode.set("auto")
+    app.out_path.set("")
+    auto_dst = app._remote_output(t, URL)
+    ui_app.APP_ROOT = _root_before
+    app.out_mode.set("custom")
+    app.out_path.set(dl_dir)
+    check("在线地址的默认落点目录会被真的创建",
+          os.path.isdir(os.path.dirname(auto_dst))
+          and os.path.normcase(os.path.dirname(auto_dst))
+          == os.path.normcase(os.path.join(tmp, "downloads")), auto_dst)
     t.container.set("保持原格式")
     check("在线地址的「保持原格式」默认给 mkv（边下边播 + 抗硬杀）",
           t.output_ext() == "mkv", t.output_ext())
@@ -744,6 +814,40 @@ def main():
     vod_hits = [p for p, ua in hits if p.startswith("/vod/") and UA_TAG in ua]
     check("分片请求确实带着 UA 发出（点播列表 + 各分片都覆盖到）",
           len(vod_hits) >= 3, f"{len(vod_hits)} 个请求")
+    # 走界面自己的「开始处理」再下一遍：命令行、ffmpeg 输出、日志落盘是同一条路
+    t.hls_record.set("3")
+    app.notebook.select(app.tabs.index(t))
+    app._on_tab_changed()
+    app.overwrite.set(True)
+    app.on_start()
+    deadline = time.time() + 90
+    while time.time() < deadline and not (app.runner and app.runner.results):
+        app.update()
+        time.sleep(0.05)
+    app.update()
+    job_results = list(app.runner.results) if app.runner else []
+    check("界面「开始处理」的在线下载真的跑完",
+          bool(job_results) and job_results[0][1] is True, str(job_results[:1])[:110])
+    real_out = job_results[0][0] if job_results else ""
+    check("产物落在指定的下载目录里",
+          os.path.isfile(real_out) and os.path.getsize(real_out) > 1000, real_out)
+    # 结束消息走的是界面队列，比 results 晚一拍到；等到它进了日志再判
+    settle = time.time() + 10
+    while time.time() < settle:
+        body = log_text()
+        if "完成" in body or "已手动停止" in body:
+            break
+        app.update()
+        time.sleep(0.05)
+    line_with_url = [ln for ln in body.splitlines() if "vod/index.m3u8" in ln]
+    check("真实流程的日志能回溯命令行，且签名参数不落地",
+          bool(line_with_url) and "参数已隐藏" in line_with_url[-1]
+          and "sign=abc123" not in body,
+          line_with_url[-1][-80:] if line_with_url else "(日志里没有该命令行)")
+    check("日志里能看到 ffmpeg 的结束报告",
+          "完成" in body or "已手动停止" in body,
+          body.rstrip().splitlines()[-1][:80] if body.strip() else "(空)")
+    t.hls_record.set("")
 
     t.hls_record.set("2")
     cmd_t = t.build_cmd(URL, os.path.join(tmp, "shape_t.mkv"))
@@ -1192,6 +1296,10 @@ def main():
     except Exception as exc:  # noqa: BLE001
         close_error = str(exc)
     check("窗口可正常关闭（含关闭时的临时文件清理）", not close_error, close_error)
+    end_text = log_text()
+    check("关窗后日志留在文件里，并以「窗口关闭」收尾",
+          os.path.isfile(app.run_log.path) and end_text.rstrip().endswith("窗口关闭"),
+          (end_text.rstrip().splitlines() or [""])[-1][:90])
     # 关窗后 temp/ 里不该留下任何本次运行的痕迹（改名预览产生的清单尤其容易漏）
     leftovers = [os.path.basename(p) for p in glob.glob(glob_pattern)
                  if os.path.isfile(p)]

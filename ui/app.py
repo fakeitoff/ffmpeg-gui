@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from core import probe as probe_mod
+from core.logfile import RunLog
 from core.probe import FFmpegNotFound, locate
 from core.runner import Job, JobRunner, LOG_LEVELS
 from core.util import (APP_ROOT, build_output_in_dir, build_output_name, ensure_dir,
@@ -63,7 +64,7 @@ def _detect_ui_scale(root) -> float:
 class App(tk.Tk):
     """主窗口。"""
 
-    def __init__(self, initial_files=None, initial_tab=None):
+    def __init__(self, initial_files=None, initial_tab=None, log_dir=None):
         _enable_dpi_awareness()      # 必须早于 Tk 初始化
         super().__init__()
         self._setup_dpi()
@@ -72,6 +73,16 @@ class App(tk.Tk):
         self.minsize(int(880 * self.ui_scale), int(560 * self.ui_scale))
 
         theme.setup_theme(self)
+        # 日志要能接住从这一刻起的所有报错，所以建得比什么都早
+        self.run_log = RunLog(log_dir)
+        if self.run_log.enabled:
+            # 用 pythonw.exe 启动时根本没有控制台，未捕获异常本来会无声消失；
+            # 钩到日志里才谈得上「事后排查」。原 hook 要留着继续调用，
+            # 接管是为了多存一份，不是把 traceback 从控制台上抹掉。
+            self._prev_excepthook = sys.excepthook
+            self._prev_thread_hook = threading.excepthook
+            sys.excepthook = self._log_uncaught
+            threading.excepthook = self._log_uncaught_thread
 
         # ---- 运行环境 ----
         self.ffmpeg_path = ""
@@ -118,11 +129,15 @@ class App(tk.Tk):
         self._preview_after = self.after(600, self._poll_preview)
 
         if self.startup_error:
+            self.run_log.header([("启动失败", self.startup_error)])
             self.log(self.startup_error, "error")
             self.btn_start.configure(state="disabled")
             messagebox.showerror("未找到 FFmpeg", self.startup_error)
         else:
             version = probe_mod.ffmpeg_version(self.ffmpeg_path)
+            self.run_log.header([("ffmpeg", self.ffmpeg_path),
+                                 ("版本", version),
+                                 ("ffprobe", self.ffprobe_path)])
             self.log(f"已就绪 · {version}", "ok")
             self.log(f"可执行文件：{self.ffmpeg_path}", "dim")
             if self.ffprobe_path == self.ffmpeg_path:
@@ -130,6 +145,9 @@ class App(tk.Tk):
                 # 但读不到时长/帧数，界面信息栏一片空白、进度条只能滚动。
                 self.log("未找到 ffprobe（同目录下的 ffprobe.exe）：媒体信息与进度百分比将不可用，"
                          "请安装包含 ffprobe 的完整版 ffmpeg。", "warn")
+
+        if self.run_log.path:
+            self.log(f"运行日志实时保存到：{self.run_log.path}", "dim")
 
         if initial_files:
             self.add_files([f for f in initial_files if os.path.isfile(f)])
@@ -574,9 +592,13 @@ class App(tk.Tk):
                             and os.path.isdir(custom)) else ""
         if not folder:
             folder = os.path.join(APP_ROOT, "downloads")
-        ensure_dir(folder)
-        name = f"{url_stem(url)}{tab.output_suffix()}.{tab.output_ext()}"
-        return os.path.join(folder, name)
+        dst = os.path.join(folder,
+                           f"{url_stem(url)}{tab.output_suffix()}.{tab.output_ext()}")
+        try:
+            ensure_dir(dst)      # ensure_dir 建的是这个「文件」的父目录，别传目录
+        except OSError:
+            pass                 # 建不出来（只读介质等）交给 ffmpeg 报错，别拖垮界面
+        return dst
 
     def resolve_output(self, src: str, tab) -> str:
         suffix = tab.output_suffix()
@@ -674,9 +696,40 @@ class App(tk.Tk):
         self._log_dirty = False
         self.log_panel.clear()
 
+    @staticmethod
+    def _format_exc(exc_type, exc, tb) -> str:
+        import traceback
+
+        return "".join(traceback.format_exception(exc_type, exc, tb)).strip()
+
+    def _log_uncaught(self, exc_type, exc, tb):
+        """主线程未捕获异常：先记进日志，再交回原来的 hook。"""
+        try:
+            self.log(f"未捕获异常（主线程）\n{self._format_exc(exc_type, exc, tb)}", "error")
+        except Exception:
+            pass
+        if self._prev_excepthook is not None:
+            self._prev_excepthook(exc_type, exc, tb)
+
+    def _log_uncaught_thread(self, args):
+        """工作线程未捕获异常：pythonw 启动时没人看得见，只能落到日志里。"""
+        try:
+            self.log(f"未捕获异常（线程 {args.thread.name}）\n"
+                     f"{self._format_exc(args.exc_type, args.exc_value, args.exc_traceback)}",
+                     "error")
+        except Exception:
+            pass
+        if self._prev_thread_hook is not None:
+            self._prev_thread_hook(args)
+
     def log(self, line: str, kind: str = "info"):
         """写日志。先入缓冲区，由 _drain_queue 每 120ms 批量刷一次 —— 逐行
-        直接插入 Text 在长任务里会明显拖慢界面（进度条看起来就像卡住）。"""
+        直接插入 Text 在长任务里会明显拖慢界面（进度条看起来就像卡住）。
+
+        文件那一头**不跟着批量刷**：界面卡死、进程被掐的时候，排查要的恰恰
+        是刚刚那几行，所以每条都立刻落盘。
+        """
+        self.run_log.write(line, kind)
         self._log_buffer.append((line, kind))
         if len(self._log_buffer) > 6000:
             del self._log_buffer[:3000]
@@ -998,6 +1051,11 @@ class App(tk.Tk):
                     pass
                 setattr(self, attr, None)
         self._cleanup_tabs()
+        try:
+            self.run_log.write("窗口关闭", "dim")
+            self.run_log.close()
+        except Exception:
+            pass
         try:
             super().destroy()
         except tk.TclError:
