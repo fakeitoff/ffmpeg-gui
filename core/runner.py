@@ -88,20 +88,44 @@ class JobRunner(threading.Thread):
         self._stop_event.set()
         with self._lock:
             proc = self._proc
-        if proc and proc.poll() is None:
+        # 这里一律读 proc.returncode，不调 proc.poll()：wait() 由 runner 线程
+        # 持有，UI 线程再去 waitpid 会把子进程状态抢走（POSIX 上会打乱 wait()）。
+        if not proc or proc.returncode is not None:
+            return
+        # 先礼貌地让它自己收尾：向 ffmpeg 的 stdin 送一个 "q"，它会像按了 q
+        # 一样退出并写完文件尾。实测 mp4 / mkv / ts 都因此 rc=0 正常收尾，
+        # 而直接 terminate() 会让 mp4 缺 moov 整段报废（直播录到一半点停止
+        # 恰恰是最常见的用法），所以这一步不能省。
+        if self._quit_gracefully(proc):
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        for _ in range(20):
+            if proc.returncode is not None:
+                break
+            time.sleep(0.05)
+        if proc.returncode is None:
             try:
-                proc.terminate()
+                proc.kill()
             except Exception:
                 pass
-            for _ in range(20):
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-            if proc.poll() is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+
+    @staticmethod
+    def _quit_gracefully(proc, wait_seconds: float = 10.0) -> bool:
+        """请求 ffmpeg 自行退出，等 runner 线程把 returncode 填上。"""
+        try:
+            proc.stdin.write("q\n")
+            proc.stdin.flush()
+        except Exception:
+            return False       # 没有 stdin（探测用的子进程等），走硬杀
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            if proc.returncode is not None:
+                return True
+            time.sleep(0.1)
+        return False
 
     @property
     def cancelled(self) -> bool:
@@ -130,10 +154,15 @@ class JobRunner(threading.Thread):
 
         done = sum(1 for _dst, ok, _msg in self.results if ok)
         failed = len(self.results) - done
+        # 用户按过「停止」，这一批的结论就该是「已停止」而不是「完成」：
+        # 直播录制到点停止时 ffmpeg 是收到 q 后 rc=0 正常退出的，
+        # 只有在汇总这一层才区分得开「录完了」和「录到一半我停了」。
+        cancelled = cancelled or self._stop_event.is_set()
         if cancelled:
             ok_all = False
             left = total - len(self.results)
-            message = f"已取消：成功 {done} 个"
+            # 优雅停止留下的产物要正面说出来，别让人以为「取消了 = 白跑了」
+            message = f"已停止：已保存 {done} 个" if done else "已停止：没有可用产物"
             if left:
                 message += f"，未处理 {left} 个"
             if failed:
@@ -157,7 +186,10 @@ class JobRunner(threading.Thread):
         try:
             proc = subprocess.Popen(
                 cmd, text=True, encoding="utf-8", errors="replace",
-                bufsize=1, **popen_kwargs(),
+                bufsize=1,
+                # stdin 要留着：取消时向它送一个 "q" 让 ffmpeg 自己收尾
+                # （DEVNULL 就只能硬杀，mp4 会缺 moov）
+                **popen_kwargs(stdin=subprocess.PIPE),
             )
         except OSError as exc:
             return False, f"无法启动 ffmpeg：{exc}"
@@ -246,6 +278,15 @@ class JobRunner(threading.Thread):
             self._proc = None
 
         if self._stop_event.is_set():
+            # 「停止」是用户主动按的，已经写下的部分就是他要的成品
+            # （录直播最常见的收尾方式）。ffmpeg 收到 q 会正常写完文件尾并返回 0，
+            # 这种产物必须留下；只有收尾失败（被强杀）的半成品才删掉——
+            # 否则磁盘上躺着一只打不开的 mp4，比什么都不留更容易误导人。
+            from .util import human_size
+
+            size = os.path.getsize(job.dst) if os.path.isfile(job.dst) else 0
+            if rc == 0 and size > 0:
+                return True, f"已手动停止 · 已保存 {human_size(size)}"
             try:
                 if os.path.exists(job.dst):
                     os.remove(job.dst)

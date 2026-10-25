@@ -89,6 +89,15 @@ class BaseTab(ttk.Frame):
         """为 True 的 batch_exclusive 模式下，可指定自定义输入路径。"""
         return None
 
+    @property
+    def src_is_remote(self) -> bool:
+        """src_override 给的是在线地址（而非本地路径）时为 True。
+
+        在线地址没有「源文件所在目录」，输出必须另找落点，
+        主窗口据此决定命名与落盘位置。
+        """
+        return False
+
     def resolve_output(self, src: str, proposed: str) -> str:
         """允许功能页调整最终输出路径（如输出图片序列的 %03d 模板）。"""
         return proposed

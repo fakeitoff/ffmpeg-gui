@@ -127,6 +127,23 @@ def stem_of(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0]
 
 
+def is_http_url(text) -> bool:
+    """「在线地址」只允许 http(s)。
+
+    其它前缀（file: / crypto: / pipe: …）交给 ffmpeg 等于开后门，
+    而且它们在命令里是合法输入，必须在界面这一层就拦掉。
+    """
+    return str(text or "").strip().lower().startswith(("http://", "https://"))
+
+
+def url_stem(url: str) -> str:
+    """从在线地址里取一个能当文件名的片段（丢掉查询串、签名 token 与扩展名）。"""
+    path = str(url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    name = os.path.splitext(path.rsplit("/", 1)[-1])[0]
+    name = re.sub(r"[^\w\u4e00-\u9fff.\-]+", "_", name).strip("._-")
+    return name[:60] or "live"
+
+
 def ext_of(path: str) -> str:
     return os.path.splitext(path)[1].lstrip(".").lower()
 

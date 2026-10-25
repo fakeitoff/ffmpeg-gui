@@ -18,7 +18,7 @@ sys.path.insert(0, ROOT)
 from core import probe as probe_mod                     # noqa: E402
 from core.probe import locate, probe                    # noqa: E402
 from core.runner import Job, JobRunner, Progress          # noqa: E402
-from core.util import local_temp_dir, popen_kwargs        # noqa: E402
+from core.util import (is_http_url, local_temp_dir, popen_kwargs, url_stem)        # noqa: E402
 
 results: list[tuple[str, bool, str]] = []
 
@@ -634,6 +634,214 @@ def main():
     app.src_files = [a, b]
     app._refresh_src_list()
     app.info = app.get_info(a)
+    for tab in app.tabs:
+        tab.on_src_changed()
+
+    # ---- 6c. 在线 m3u8：下载 / 录制直播（本地起 http 服务，不外连）----
+    import http.server
+    import socket as _socket
+    import threading as _threading
+
+    serve_dir = os.path.join(tmp, "web")
+    os.makedirs(os.path.join(serve_dir, "vod"), exist_ok=True)
+    UA_TAG = "ffgui-selftest"
+    hits: list[tuple[str, str]] = []
+
+    class _Gate(http.server.BaseHTTPRequestHandler):
+        """只放行带测试 UA 的请求：403 / 200 的差别正是 User-Agent 参数存在的理由。"""
+
+        def do_GET(self):
+            hits.append((self.path, self.headers.get("User-Agent", "")))
+            if UA_TAG not in self.headers.get("User-Agent", ""):
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"denied")
+                return
+            full = os.path.join(serve_dir, self.path.split("?")[0].lstrip("/").replace("/", os.sep))
+            if not os.path.isfile(full):
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = open(full, "rb").read()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    _sk = _socket.socket()
+    _sk.bind(("127.0.0.1", 0))
+    PORT = _sk.getsockname()[1]
+    _sk.close()
+    web = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), _Gate)
+    _threading.Thread(target=web.serve_forever, daemon=True).start()
+
+    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", a,
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-force_key_frames", "expr:gte(t,n_forced*1)", "-c:a", "aac",
+                    "-hls_time", "1", "-hls_list_size", "0",
+                    "-hls_segment_filename", os.path.join(serve_dir, "vod", "v%d.ts"),
+                    os.path.join(serve_dir, "vod", "index.m3u8")],
+                   check=True, **popen_kwargs())
+    URL = f"http://127.0.0.1:{PORT}/vod/index.m3u8?sign=abc123&t=2"
+
+    local_only = probe_mod.hls_input_args(playlist)
+    net_only = probe_mod.hls_input_args(URL, UA_TAG, "http://127.0.0.1")
+    check("网络参数只给在线地址（本地列表带上会 Option not found）",
+          "-reconnect" not in local_only and "-user_agent" not in local_only
+          and all(k in net_only for k in ("-reconnect", "-user_agent", "-referer",
+                                          "-protocol_whitelist", "-allowed_extensions")),
+          " ".join(net_only[:10]))
+    check("带 ?签名 的在线地址仍认成播放列表，文件名不含签名",
+          probe_mod.is_hls_playlist(URL) and is_http_url(URL)
+          and url_stem(URL) == "index" and "sign" not in url_stem(URL), url_stem(URL))
+    check("非 http(s) 前缀的地址被拒", not is_http_url("file:///C:/x.m3u8")
+          and not is_http_url("crypto://x") and is_http_url("HTTPS://h/a.m3u8"))
+    check("本地文件名里的 ? 不会被当成查询串（Linux 下它是合法字符）",
+          probe_mod.is_hls_playlist("/tmp/a?.m3u8") and not probe_mod.is_hls_playlist("/tmp/a.txt"))
+
+    no_ua = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error",
+                            *probe_mod.HLS_BASE_ARGS, "-i", URL, "-c", "copy", "-y",
+                            os.path.join(tmp, "no_ua.mkv")], **popen_kwargs())
+    check("不带 UA 会被服务端 403 拒绝（证明这个参数不是摆设）",
+          no_ua.returncode != 0 and b"403" in (no_ua.stderr or b""),
+          ((no_ua.stderr or b"").decode("utf-8", "replace").strip().splitlines() or [""])[-1][:90])
+
+    t = tabs["MergeTab"]
+    t.operation.set("m3u8 合成 · 播放列表 / 分片合成一个视频")
+    t._on_operation()
+    t.hls_url.set(URL)
+    t.hls_ua.set(UA_TAG)
+    t.hls_refer.set("http://127.0.0.1/")
+    t.container.set("mkv")
+    t.hls_record.set("")
+    err = t.validate()
+    check("在线地址通过校验", err is None, str(err))
+    dl_dir = os.path.join(tmp, "dl")
+    os.makedirs(dl_dir, exist_ok=True)
+    _mode_before, _path_before = app.out_mode.get(), app.out_path.get()
+    app.out_mode.set("custom")
+    app.out_path.set(dl_dir)
+    remote_dst = app._remote_output(t, URL)
+    check("在线地址的输出用地址里最后一段命名，落到指定目录",
+          os.path.normcase(os.path.dirname(remote_dst)) == os.path.normcase(dl_dir)
+          and os.path.basename(remote_dst) == "index_merged.mkv", remote_dst)
+    t.container.set("保持原格式")
+    check("在线地址的「保持原格式」默认给 mkv（边下边播 + 抗硬杀）",
+          t.output_ext() == "mkv", t.output_ext())
+    t.container.set("mkv")
+
+    run("在线 m3u8 下载到 MKV", t, "40_web_dl.mkv", src=URL)
+    try:
+        dinfo = probe(ffprobe, os.path.join(tmp, "40_web_dl.mkv"))
+        check("在线下载产物时长与音视频流俱全",
+              3.4 < dinfo.duration < 5.0 and dinfo.has_video and dinfo.has_audio,
+              f"{dinfo.duration:.2f}s · {dinfo.describe()}")
+    except Exception as exc:  # noqa: BLE001
+        check("在线下载产物时长与音视频流俱全", False, str(exc))
+    vod_hits = [p for p, ua in hits if p.startswith("/vod/") and UA_TAG in ua]
+    check("分片请求确实带着 UA 发出（点播列表 + 各分片都覆盖到）",
+          len(vod_hits) >= 3, f"{len(vod_hits)} 个请求")
+
+    t.hls_record.set("2")
+    cmd_t = t.build_cmd(URL, os.path.join(tmp, "shape_t.mkv"))
+    check("填了录制时长就带 -t（到点自停）",
+          "-t" in cmd_t and cmd_t[cmd_t.index("-t") + 1] == "2", " ".join(cmd_t[:6]))
+    check("录制时长就是预期时长（进度条按它算百分比）",
+          abs((t.expected_duration(URL) or 0) - 2.0) < 0.01,
+          f"{t.expected_duration(URL)}")
+    t.hls_record.set("abc")
+    bad_rec = t.validate()
+    check("录制时长填非数字时提前拦下", bool(bad_rec) and "正数" in bad_rec, str(bad_rec))
+    t.hls_record.set("")
+    check("没填录制时长按「随时可停」处理，不谎报百分比",
+          t.expected_duration(URL) is None and t.expected_frames(URL) == 0,
+          str(t.expected_duration(URL)))
+    t.hls_record.set("2")
+    run("在线 m3u8 只录 2 秒", t, "41_web_rec2.mkv", src=URL)
+    try:
+        rinfo = probe(ffprobe, os.path.join(tmp, "41_web_rec2.mkv"))
+        check("录制 2 秒的产物确实约 2 秒", 1.4 < rinfo.duration < 3.2,
+              f"{rinfo.duration:.2f}s")
+    except Exception as exc:  # noqa: BLE001
+        check("录制 2 秒的产物确实约 2 秒", False, str(exc))
+    t.hls_record.set("")
+
+    t.hls_url.set("ftp://host/a.m3u8")
+    check("非 http(s) 地址在校验里被拒", "http" in str(t.validate()), str(t.validate()))
+    t.hls_url.set("http://host/notalist?x=1")
+    check("认不出播放列表扩展名的地址给出明确提示",
+          "m3u8" in str(t.validate()), str(t.validate()))
+    t.hls_url.set(URL)
+
+    # ---- 边下边播 + 手动停止（用 -re 限速的本地长任务，不依赖网络时序）----
+    long_src = os.path.join(tmp, "long30.mp4")
+    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=30",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=30",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", long_src], check=True, **popen_kwargs())
+
+    def grow_probe(dst):
+        return subprocess.run([ffprobe, "-v", "error", "-show_entries", "stream=codec_type",
+                               "-of", "csv=p=0", dst], **popen_kwargs()).returncode
+
+    mid = {}
+    stop_msg = {}
+    stop_result = {}
+    for dst in (os.path.join(tmp, "42_grow.mkv"), os.path.join(tmp, "42_grow.mp4")):
+        args = ["-re", "-i", long_src, "-c", "copy"]
+        if dst.endswith(".mp4"):
+            args += ["-movflags", "+faststart"]
+        args += [dst]
+        msgs: list[str] = []
+        jr = JobRunner([Job(long_src, dst, args, duration=30.0)], ffmpeg, overwrite=True,
+                       on_finished=lambda ok, msg, _m=msgs: _m.append(msg))
+        jr.start()
+        deadline = time.time() + 20
+        while time.time() < deadline and (not os.path.exists(dst)
+                                         or os.path.getsize(dst) < 30000):
+            time.sleep(0.1)
+        mid[dst] = (grow_probe(dst), os.path.getsize(dst) if os.path.exists(dst) else 0)
+        jr.cancel()                       # 走 UI 上「停止」按钮那条路
+        jr.join(timeout=25)
+        stop_msg[dst] = msgs[0] if msgs else "(没有结束回调)"
+        stop_result[dst] = list(jr.results)
+
+    mkv_mid, mp4_mid = mid[os.path.join(tmp, "42_grow.mkv")], mid[os.path.join(tmp, "42_grow.mp4")]
+    check("边下边播：mkv 还在写就能打开", mkv_mid[0] == 0 and mkv_mid[1] > 0,
+          f"打开rc={mkv_mid[0]} 已写 {mkv_mid[1]} 字节")
+    check("边下边播：mp4 没写完打不开（所以直播默认给 mkv）",
+          mp4_mid[0] != 0, f"打开rc={mp4_mid[0]} 已写 {mp4_mid[1]} 字节")
+    mkv_out = os.path.join(tmp, "42_grow.mkv")
+    check("点「停止」后已录的部分不会被删掉", os.path.isfile(mkv_out)
+          and os.path.getsize(mkv_out) > 0, f"{os.path.getsize(mkv_out)} 字节")
+    mkv_agg = stop_msg[mkv_out]
+    mkv_per = stop_result[mkv_out][0][2] if stop_result[mkv_out] else "(无结果)"
+    check("停止的措辞区分「录完」与「我停了」：汇总说已停止、单任务说已保存",
+          "已停止" in mkv_agg and "已手动停止" in mkv_per, f"{mkv_agg} ｜ {mkv_per}")
+    try:
+        ginfo = probe(ffprobe, mkv_out)
+        check("手动停止的录像完整可解码", ginfo.duration > 1 and ginfo.has_video,
+              f"{ginfo.duration:.2f}s · {ginfo.describe()}")
+    except Exception as exc:  # noqa: BLE001
+        check("手动停止的录像完整可解码", False, str(exc))
+    mp4_out = os.path.join(tmp, "42_grow.mp4")
+    mp4_per = stop_result[mp4_out][0][2] if stop_result[mp4_out] else "(无结果)"
+    check("mp4 靠优雅收尾也能保住（送 q 后写完 moov）",
+          grow_probe(mp4_out) == 0 and "已手动停止" in mp4_per,
+          f"打开rc={grow_probe(mp4_out)} ｜ {mp4_per} ｜ "
+          f"{os.path.getsize(mp4_out) if os.path.exists(mp4_out) else 0} 字节")
+
+    web.shutdown()
+    app.out_mode.set(_mode_before)
+    app.out_path.set(_path_before)
+    t.hls_url.set("")
+    t.hls_ua.set("")
+    t.hls_refer.set("")
+    t.container.set("保持原格式")
     for tab in app.tabs:
         tab.on_src_changed()
 

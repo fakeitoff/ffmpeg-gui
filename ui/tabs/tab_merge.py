@@ -8,8 +8,8 @@ import tkinter as tk
 from tkinter import ttk
 
 from core import builder, probe
-from core.util import local_temp_dir
-from .. import widgets
+from core.util import is_http_url, local_temp_dir
+from .. import theme, widgets
 from .base import BaseTab
 from .subform import SubForm
 
@@ -51,8 +51,9 @@ class MergeTab(BaseTab):
     hint = ("把多个视频接成一段时，默认「直接拼接」不重新编码，只复制视频流与音频流，"
             "秒级完成且画质无损；只有各段分辨率或编码不一致时，才需要改用「兼容拼接」。"
             "拼接顺序就是主界面文件列表的顺序（可用 ↑ ↓ 调整）。\n"
-            "下载站常见的 .m3u8 也在这里合成：选「m3u8 合成」，把播放列表 + 分片变成一个"
-            "普通视频文件（支持 AES-128 加密分片），播放列表放在主界面文件列表的第一位。")
+            "「m3u8 合成」把播放列表变成一个普通视频文件：本地列表（分片同目录，"
+            "支持 AES-128 加密分片），也可以直接填在线地址 http(s)://…m3u8 "
+            "下载点播或录制直播；填了录制时长的会到点自停，没填的一直录到点「停止」。")
     accept = "video"
     suffix = "_merged"
 
@@ -85,6 +86,11 @@ class MergeTab(BaseTab):
 
         # m3u8 合成
         self.hls_mode = tk.StringVar(value="copy")         # copy / reencode
+        self.hls_url = tk.StringVar(value="")
+        self.hls_ua = tk.StringVar(value="")
+        self.hls_refer = tk.StringVar(value="")
+        self.hls_record = tk.StringVar(value="")           # 录制时长（秒）；空 = 一直录
+        self._hls_info_cache: dict = {}
 
         # 音视频合并
         self.audio_file = tk.StringVar(value="")
@@ -100,7 +106,8 @@ class MergeTab(BaseTab):
 
         f.combo("操作类型", self.operation, [label for _k, label in OPERATIONS],
                 width=40, on_change=self._on_operation)
-        self.container_cb = f.combo("输出格式", self.container, CONTAINERS, width=16)
+        self.container_cb = f.combo("输出格式", self.container, CONTAINERS, width=16,
+                                    on_change=self._update_hls_tip)
 
         self.box = ttk.Frame(self.form_holder, style="Panel.TFrame")
         self.box.grid(row=f.row, column=0, columnspan=2, sticky="ew")
@@ -192,8 +199,18 @@ class MergeTab(BaseTab):
         # ---------------- m3u8 合成 ----------------
         self.hls_box = self._new_box()
         g = SubForm(self.hls_box)
-        row = g.field("播放列表")
-        ttk.Label(row, text="主界面已选的第一个 .m3u8 文件",
+        g.field_hint("在线地址", self.hls_url, width=58,
+                     hint="http(s)://…/index.m3u8　填了就优先用它（下载 / 录制直播）")
+        self.hls_url.trace_add("write", lambda *_a: self._update_hls_tip())
+        row = g.field("防盗链 UA")
+        ttk.Entry(row, textvariable=self.hls_ua, width=44).grid(row=0, column=0, sticky="w")
+        ttk.Button(row, text="浏览器 UA", width=10,
+                   command=self._use_browser_ua).grid(row=0, column=1, padx=(6, 0))
+        g.entry("Referer", self.hls_refer, width=58)
+        g.field_hint("录制时长", self.hls_record, width=10,
+                     hint="秒。留空 = 一直录到点「停止」（点播/已完成的直播不用填）")
+        row = g.field("本地列表")
+        ttk.Label(row, text="未填在线地址时，用主界面已选的第一个 .m3u8 文件",
                   style="PanelMuted.TLabel").grid(row=0, column=0, sticky="w")
         row = g.field("合成方式")
         ttk.Radiobutton(row, text="直接合成（复制视频流 + 音频流，不重新编码）",
@@ -210,12 +227,22 @@ class MergeTab(BaseTab):
         g.row += 1
         self._encode_rows(SubForm(self.hls_rec_box))
 
-        g.note("m3u8 只是播放列表，画面数据都在同目录的分片（.ts / .m4s）里，"
-               "所以「合成」是把列表指向的分片按顺序装进一个普通视频文件，"
-               "默认不重新编码、画质无损、几秒钟完成；输出格式建议 mp4 或 mkv。\n"
-               "AES-128 加密的直播回放也支持，但密钥文件必须和列表、分片放在一起。"
-               "只有本地路径会被检查，网络分片需要联网读取。\n"
-               "如果目录里只有一堆 .ts 而没有列表，请改用「首尾拼接」把所有分片按顺序加进主界面。")
+        self.hls_tip = ttk.Label(self.hls_box, text="", style="PanelMuted.TLabel",
+                                 wraplength=widgets.scaled(self.hls_box, 640),
+                                 justify="left")
+        self.hls_tip.grid(row=g.row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        g.row += 1
+
+        g.note("m3u8 只是播放列表，画面数据都在分片里：本地列表要求分片同目录，"
+               "在线地址则由 ffmpeg 现取现拼，默认不重新编码、画质无损。\n"
+               "在线列表常做防盗链：只认浏览器 UA / Referer，实测不带会被服务端 403 拒绝，"
+               "所以这两个框专门留出来（只发给 http(s) 输入，本地文件不能带这些参数）。"
+               "网络中断会自动重连。\n"
+               "直播流（列表里没有 ENDLIST）会一直跟播：想停就点「停止」，"
+               "程序会让 ffmpeg 自己收尾（实测 mp4 / mkv 都能完整退出、文件可播），"
+               "已录下多少就存下多少。\n"
+               "边下边播请选 mkv 或 ts：mp4 的文件尾（moov）要等写完才存在，"
+               "实测录制中途打开会报 moov atom not found，打不开。")
 
         # ---------------- 音视频合并 ----------------
         self.mux_box = self._new_box()
@@ -307,6 +334,102 @@ class MergeTab(BaseTab):
             self.hls_rec_box.grid()
         else:
             self.hls_rec_box.grid_remove()
+        self._update_hls_tip()
+
+    # ---------------- m3u8：在线地址 / 录制 ----------------
+    BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+    def _remote_target(self) -> str:
+        """在线地址（去首尾空格）；没填返回空串。"""
+        return self.hls_url.get().strip()
+
+    @property
+    def src_override(self):
+        return self._remote_target() or None
+
+    @property
+    def src_is_remote(self) -> bool:
+        return bool(self._remote_target())
+
+    def _headers(self) -> tuple[str, str]:
+        return (self.hls_ua.get().strip(), self.hls_refer.get().strip())
+
+    def _record_seconds(self) -> float:
+        """录制时长上限。0 = 留空（一直录到手动停止），-1 = 填了但不是正数。"""
+        text = self.hls_record.get().strip()
+        if not text:
+            return 0.0
+        try:
+            value = float(text)
+        except ValueError:
+            return -1.0
+        return value if value > 0 else -1.0
+
+    def _use_browser_ua(self):
+        self.hls_ua.set(self.BROWSER_UA)
+        self._update_hls_tip()
+
+    def _hls_info(self, src: str):
+        """带防盗链头去探测源，拿点播总时长与帧数（在线/本地列表都走这里）。"""
+        ua, refer = self._headers()
+        args = probe.hls_input_args(src, ua, refer)
+        if not args:
+            return self.app.get_info(src)
+        key = (src, tuple(args))
+        if key not in self._hls_info_cache:
+            if len(self._hls_info_cache) > 8:      # 只是个小缓存，别让它无限长
+                self._hls_info_cache.clear()
+            try:
+                self._hls_info_cache[key] = probe.probe(self.app.ffprobe_path, src,
+                                                        input_args=args)
+            except Exception:
+                self._hls_info_cache[key] = None
+        return self._hls_info_cache[key]
+
+    def _hls_frames(self, src: str) -> int:
+        """进度按帧算时要有帧数；时长未知的直播返回 0（退回滚动动画）。"""
+        total = self.expected_duration(src)
+        if not total:
+            return 0
+        info = self._hls_info(src)
+        if info and info.video_frames and abs(total - float(info.duration or 0)) < 0.51:
+            return info.video_frames          # 就是源本身（点播）
+        fps = info.video.fps if info and info.video else 0
+        return self.frames_from_fps(total, fps) if fps else 0
+
+    def _update_hls_tip(self):
+        """把「能不能边下边播、什么时候会真的结束」这件事说在前面。"""
+        if not hasattr(self, "hls_tip"):
+            return
+        if self._op_key() != "hls":
+            self.hls_tip.configure(text="", foreground=theme.MUTED)
+            self.hls_tip.grid_remove()
+            return
+        self.hls_tip.grid()
+        if not self._remote_target():
+            self.hls_tip.configure(text="", foreground=theme.MUTED)
+            return
+        secs = self._record_seconds()
+        ext = self.output_ext()
+        if secs > 0:
+            self.hls_tip.configure(
+                text=f"下载约 {secs:g} 秒后自动结束，进度条按这个时长算百分比。",
+                foreground=theme.MUTED)
+        elif ext in ("mp4", "mov", "m4v"):
+            self.hls_tip.configure(
+                text="未填录制时长＝随时可能停，所以不显示百分比（进度条滚动，"
+                     "状态栏显示已用时 / 速度 / 已写入大小）。"
+                     "此刻输出是 mp4：mp4 的文件尾（moov）要等写完才存在，"
+                     "录制中途打不开（实测 moov atom not found），想边下边播请改选 mkv；"
+                     "点「停止」会让 ffmpeg 收尾，之后 mp4 也是完整可播的。",
+                foreground=theme.WARN)
+        else:
+            self.hls_tip.configure(
+                text=f"未填录制时长＝随时可能停，不显示百分比（进度条滚动，状态栏显示已用时 / "
+                     f"速度 / 已写入大小）。输出 {ext} 支持边下边播：还在写就能打开看已下载的部分；"
+                     "点播整片想要百分比，可把列表总时长填进「录制时长」。",
+                foreground=theme.MUTED)
 
     def _on_transition(self):
         if self.join_mode.get() == "reencode" and self.transition_on.get():
@@ -357,6 +480,10 @@ class MergeTab(BaseTab):
     def output_ext(self) -> str:
         v = self.container.get()
         if v == "保持原格式":
+            if self._op_key() == "hls" and self._remote_target():
+                # 在线列表没有「原格式」可言；直播录制选 mkv 最稳：
+                # 实测它支持边下边播，硬杀也只是「提前结束」，mp4 会整段报废
+                return "mkv"
             ext = self.app.src_ext() or "mp4"
             # m3u8 是播放列表不是容器，「保持原格式」对它没有意义
             return "mp4" if ext in ("m3u8", "m3u") else ext
@@ -368,6 +495,17 @@ class MergeTab(BaseTab):
 
     def expected_duration(self, src: str) -> float | None:
         """拼接后总时长 = 各段之和（减去转场重叠），否则进度条百分比会算错。"""
+        if self._op_key() == "hls":
+            secs = self._record_seconds()
+            if secs > 0:
+                return secs
+            if is_http_url(src):
+                # 在线直播不填时长就是「随时会停」，报个百分比反而像卡住了：
+                # 这时进度条走滚动动画，状态栏显示已用时 / 速度 / 已写入大小
+                return None
+            if not probe.playlist_report(src)["has_endlist"]:
+                return None
+            return super().expected_duration(src)
         if self._op_key() != "concat":
             return super().expected_duration(src)
         sources = list(self.app.src_files) or [src]
@@ -387,6 +525,8 @@ class MergeTab(BaseTab):
 
     def expected_frames(self, src: str) -> int:
         """拼接后的总帧数 = 各段帧数之和（转场模式近似按时长比例折减）。"""
+        if self._op_key() == "hls":
+            return self._hls_frames(src)
         if self._op_key() != "concat":
             return super().expected_frames(src)
         sources = list(self.app.src_files) or [src]
@@ -448,9 +588,22 @@ class MergeTab(BaseTab):
                 if dur >= shortest:
                     return f"转场时长必须小于最短片段的长度（{shortest:.2f} 秒）。"
         elif op == "hls":
+            secs = self._record_seconds()
+            if secs < 0:
+                return "录制时长要填正数（秒），或留空表示一直录到点「停止」。"
+            url = self._remote_target()
+            if url:
+                if not is_http_url(url):
+                    return (f"在线地址只支持 http:// 或 https://，当前是：{url}\n"
+                            "（其它前缀不能交给 ffmpeg 打开）")
+                if not probe.is_hls_playlist(url):
+                    return ("在线地址里要能看出播放列表扩展名（.m3u8 / .m3u），"
+                            f"查询参数不算。当前是：{url}")
+                return None
             files = self.app.src_files
             if not files:
-                return "请先在主界面选择 .m3u8 播放列表文件。"
+                return ("请在主界面选择 .m3u8 播放列表文件，"
+                        "或在上方的「在线地址」里填 http(s) 播放列表。")
             playlist = files[0]
             if not probe.is_hls_playlist(playlist):
                 return (f"第一个文件不是 m3u8 播放列表：{os.path.basename(playlist)}\n"
@@ -678,13 +831,17 @@ class MergeTab(BaseTab):
 
     # ============================================================== m3u8 合成
     def _build_hls(self, src: str, dst: str) -> list[str]:
-        """把播放列表指向的分片合成成一个普通视频文件。
+        """把播放列表指向的分片合成成一个普通视频文件（本地列表或在线地址）。
 
         输入参数必须排在 ``-i`` 之前才作用到这个输入上。
         复制流时不要手动加 ``-bsf:a aac_adtstoasc``：ffmpeg 会为 MP4 自动补，
         而音频不是 AAC（mp3 / ac3）的列表写了它反而打不开输出文件。
         """
-        args = list(probe.HLS_INPUT_ARGS) + ["-i", src]
+        ua, refer = self._headers()
+        args = probe.hls_input_args(src, ua, refer) + ["-i", src]
+        secs = self._record_seconds()
+        if secs > 0:
+            args += ["-t", f"{secs:g}"]        # 录制上限：到点自己停，进度条也按它算
         if self.hls_mode.get() == "reencode":
             args += self._video_encode_args() + self._audio_encode_args()
         else:

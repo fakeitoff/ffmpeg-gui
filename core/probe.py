@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 
-from .util import popen_kwargs
+from .util import is_http_url, popen_kwargs
 
 # 常见安装位置（PATH 中找不到时兜底搜索）
 _WIN_FALLBACKS = [
@@ -115,21 +115,45 @@ def ffmpeg_version(ffmpeg_path: str) -> str:
 #   * 不加 crypto 协议时同一份加密列表直接 "Invalid data found"；
 #   * 分片走 http(s) 时不加 http 协议则读不到任何流。
 # 三个参数都属于「输入选项」，必须排在 -i 之前才会作用到输入上。
-HLS_INPUT_ARGS = ["-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-                  "-allowed_extensions", "ALL"]
+HLS_PROTOCOL_WHITELIST = "file,http,https,tcp,tls,crypto"
+HLS_BASE_ARGS = ["-protocol_whitelist", HLS_PROTOCOL_WHITELIST,
+                 "-allowed_extensions", "ALL"]
+# 断线重连只对 http(s) 协议存在：和本地列表混着传，ffmpeg 会直接
+# "Option not found" 退出（实测），所以网络参数必须按输入是不是在线地址来加。
+HLS_NETWORK_ARGS = ["-reconnect", "1", "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "30"]
 _HLS_EXTS = (".m3u8", ".m3u")
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 _URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 
 
 def is_hls_playlist(path) -> bool:
-    """按扩展名判断是否为 HLS 播放列表（m3u8 只是清单，不含任何画面数据）。"""
-    return os.path.splitext(str(path or ""))[1].lower() in _HLS_EXTS
+    """按扩展名判断是否为 HLS 播放列表（m3u8 只是清单，不含任何画面数据）。
+
+    在线地址要先去掉 ``?签名参数`` / ``#片段`` 再看扩展名，
+    否则 ``index.m3u8?token=abc`` 会被判成非播放列表。
+    本地路径不这么切：``?`` 在 Linux 文件名里合法，切了会把 ``a?.m3u8``
+    认成没有扩展名。
+    """
+    text = str(path or "")
+    if is_http_url(text):
+        text = text.split("?", 1)[0].split("#", 1)[0]
+    return os.path.splitext(text)[1].lower() in _HLS_EXTS
 
 
-def hls_input_args(path) -> list[str]:
+def hls_input_args(path, user_agent: str = "", referer: str = "") -> list[str]:
     """是播放列表时返回需要插在 ``-i`` 之前的参数，否则返回空表。"""
-    return list(HLS_INPUT_ARGS) if is_hls_playlist(path) else []
+    if not is_hls_playlist(path):
+        return []
+    args = list(HLS_BASE_ARGS)
+    if not is_http_url(path):
+        return args
+    args += list(HLS_NETWORK_ARGS)
+    if user_agent:
+        args += ["-user_agent", user_agent]
+    if referer:
+        args += ["-referer", referer]
+    return args
 
 
 def playlist_report(path: str) -> dict:
@@ -139,7 +163,8 @@ def playlist_report(path: str) -> dict:
     少一个时 ffmpeg 只会丢一句含糊的错误（甚至算出个空文件），
     所以这里提前点名。远程 URI 不做本地检查。
     """
-    rep = {"segments": 0, "variants": 0, "missing": [], "missing_total": 0, "error": ""}
+    rep = {"segments": 0, "variants": 0, "missing": [], "missing_total": 0,
+           "has_endlist": False, "error": ""}
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
             text = fh.read()
@@ -165,6 +190,9 @@ def playlist_report(path: str) -> dict:
             continue
         if line.startswith("#EXT-X-STREAM-INF"):
             pending_stream = True          # 下一行是子列表（多码率主列表）
+            continue
+        if line.startswith("#EXT-X-ENDLIST"):
+            rep["has_endlist"] = True      # 有终点＝点播；没有＝还在直播
             continue
         if line.startswith("#"):
             for uri in _URI_ATTR_RE.findall(line):   # EXT-X-KEY / EXT-X-MAP
@@ -418,11 +446,18 @@ def count_packets(ffprobe_path: str, path: str, timeout: int = 30) -> dict:
     return counts
 
 
-def probe(ffprobe_path: str, path: str, timeout: int = 30) -> MediaInfo:
-    """调用 ffprobe 读取媒体信息（失败抛出 RuntimeError）。"""
+def probe(ffprobe_path: str, path: str, timeout: int = 30,
+          input_args=None) -> MediaInfo:
+    """调用 ffprobe 读取媒体信息（失败抛出 RuntimeError）。
+
+    ``input_args`` 用于在线播放列表这类需要额外输入选项的源
+    （比如带防盗链的 m3u8 要同时传 User-Agent）；不传则按路径自动推导。
+    """
+    if input_args is None:
+        input_args = hls_input_args(path)
     cmd = [
         ffprobe_path, "-v", "error", "-hide_banner",
-        *hls_input_args(path),
+        *input_args,
         "-print_format", "json",
         "-show_format", "-show_streams",
         "-i", path,

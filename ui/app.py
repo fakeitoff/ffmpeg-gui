@@ -12,9 +12,9 @@ from tkinter import filedialog, messagebox, ttk
 from core import probe as probe_mod
 from core.probe import FFmpegNotFound, locate
 from core.runner import Job, JobRunner, LOG_LEVELS
-from core.util import (build_output_in_dir, build_output_name, ext_of, format_time,
-                       human_size, local_temp_dir, natural_key, open_in_explorer,
-                       purge_dir, purge_stale_temp, same_file)
+from core.util import (APP_ROOT, build_output_in_dir, build_output_name, ensure_dir,
+                       ext_of, format_time, human_size, local_temp_dir, natural_key,
+                       open_in_explorer, purge_dir, purge_stale_temp, same_file, url_stem)
 from . import theme, widgets
 from .tabs import TAB_CLASSES
 
@@ -515,7 +515,13 @@ class App(tk.Tk):
         self.out_entry.configure(state=state)
         self.out_browse.configure(state=state)
         if auto:
-            self.out_hint.configure(text="输出文件将与源文件放在同一目录，文件名自动加处理后缀。")
+            tab = self.current_tab()
+            if getattr(tab, "src_is_remote", False):
+                self.out_hint.configure(
+                    text="在线地址没有「源文件目录」，输出默认落在程序目录的 downloads/ 下；"
+                         "切到「指定输出目录」可以自己改。")
+            else:
+                self.out_hint.configure(text="输出文件将与源文件放在同一目录，文件名自动加处理后缀。")
         elif len(self.src_files) > 1:
             self.out_hint.configure(text="已选择多个文件：请填写一个【输出目录】。")
         else:
@@ -544,11 +550,33 @@ class App(tk.Tk):
         tab = self.current_tab()
         if tab is None:
             return
+        if getattr(tab, "src_is_remote", False) and tab.src_override:
+            # 只在这个框「自动」的时候回显落点；用户在「指定输出目录」里填的
+            # 是目录，一旦被这个文件路径覆盖，落点判断就会被带偏。
+            if self.out_mode.get() == "auto" or not self.out_path.get().strip():
+                self.out_path.set(self._remote_output(tab, tab.src_override))
+            return
         if self.out_mode.get() == "auto" and self.src_files:
             name = build_output_name(self.src_files[0], tab.output_suffix(), tab.output_ext())
             self.out_path.set(name)
         elif not self.out_path.get() and self.src_files:
             self.out_path.set(build_output_name(self.src_files[0], tab.output_suffix(), tab.output_ext()))
+
+    def _remote_output(self, tab, url: str) -> str:
+        """在线地址的输出落点。
+
+        「与源文件同目录」对 URL 没有意义，所以固定落到程序目录的 ``downloads/``，
+        除非用户在输出路径里填了一个已存在的目录。文件名取地址里最后一段，
+        丢掉 ``?签名=…`` 那类查询串。
+        """
+        custom = self.out_path.get().strip()
+        folder = custom if (self.out_mode.get() == "custom" and custom
+                            and os.path.isdir(custom)) else ""
+        if not folder:
+            folder = os.path.join(APP_ROOT, "downloads")
+        ensure_dir(folder)
+        name = f"{url_stem(url)}{tab.output_suffix()}.{tab.output_ext()}"
+        return os.path.join(folder, name)
 
     def resolve_output(self, src: str, tab) -> str:
         suffix = tab.output_suffix()
@@ -723,7 +751,9 @@ class App(tk.Tk):
             src = tab.src_override or (self.src_files[0] if self.src_files else None)
             if not src:
                 return None, "请先选择源文件。"
-            if tab.src_override:
+            if getattr(tab, "src_is_remote", False):
+                dst = self._remote_output(tab, src)
+            elif tab.src_override:
                 pattern = str(src)
                 head = pattern.split("%")[0]
                 folder = os.path.dirname(os.path.abspath(head)) or os.getcwd()
