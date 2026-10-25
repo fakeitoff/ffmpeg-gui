@@ -510,6 +510,120 @@ def main():
     except Exception as exc:  # noqa: BLE001
         check("多音轨封装含 2 条音轨", False, str(exc))
 
+    # ---- 6b. m3u8 合成（下载站的「播放列表 + 分片」变成一个视频）----
+    t = tabs["MergeTab"]
+    hls_dir = os.path.join(tmp, "hls")
+    os.makedirs(hls_dir, exist_ok=True)
+    playlist = os.path.join(hls_dir, "test.m3u8")
+    # 必须真切成多片：x264 默认 GOP 远长于素材，不强制关键帧时 -hls_time 1
+    # 也只有一个分片，跨分片拼接根本没被测到。
+    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", a,
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-force_key_frames", "expr:gte(t,n_forced*1)", "-c:a", "aac",
+                    "-hls_time", "1", "-hls_list_size", "0",
+                    "-hls_segment_filename", os.path.join(hls_dir, "seg%d.ts"),
+                    playlist], check=True, **popen_kwargs())
+    segs = sorted(glob.glob(os.path.join(hls_dir, "seg*.ts")))
+    rep = probe_mod.playlist_report(playlist)
+    check("m3u8 识别 + 分片清点",
+          probe_mod.is_hls_playlist(playlist) and len(segs) >= 2
+          and rep["segments"] == len(segs) and not rep["missing"],
+          f"磁盘 {len(segs)} 片 / 报告 {rep['segments']} 片")
+    try:
+        hinfo = probe(ffprobe, playlist)
+        check("ffprobe 读 m3u8 能拿到时长与帧数（进度条依赖它）",
+              hinfo.has_video and hinfo.duration > 3 and hinfo.video_frames > 0,
+              f"{hinfo.duration:.2f}s {hinfo.video_frames} 帧")
+    except Exception as exc:  # noqa: BLE001
+        check("ffprobe 读 m3u8 能拿到时长与帧数（进度条依赖它）", False, str(exc))
+
+    t.operation.set("m3u8 合成 · 播放列表 / 分片合成一个视频")
+    t._on_operation()
+    t.hls_mode.set("copy")
+    t._on_hls_mode()
+    t.container.set("保持原格式")
+    app.src_files = [playlist]
+    app._refresh_src_list()
+    app.info = app.get_info(playlist)
+    cmd_h = t.build_cmd(playlist, os.path.join(tmp, "shape.mp4"))
+    check("HLS 输入参数排在 -i 之前，且不手写 -bsf:a（音频非 AAC 时会打不开输出）",
+          cmd_h.index("-protocol_whitelist") < cmd_h.index("-i")
+          and "-allowed_extensions" in cmd_h and "-bsf:a" not in cmd_h,
+          " ".join(cmd_h[:8]))
+    check("m3u8 的「保持原格式」不会输出 .m3u8 文件", t.output_ext() == "mp4",
+          t.output_ext())
+    run("m3u8 直接合成 → MP4", t, "37_hls_copy.mp4", src=playlist)
+    try:
+        hc = probe(ffprobe, os.path.join(tmp, "37_hls_copy.mp4"))
+        check("合成结果时长≈源且音视频流俱全",
+              3.5 < hc.duration < 4.8 and hc.has_video and hc.has_audio,
+              f"{hc.duration:.2f}s · {hc.describe()}")
+    except Exception as exc:  # noqa: BLE001
+        check("合成结果时长≈源且音视频流俱全", False, str(exc))
+
+    # 分片没下全是最常见的失败，必须提前点名缺了谁
+    lonely_dir = os.path.join(tmp, "lonely")
+    os.makedirs(lonely_dir, exist_ok=True)
+    lonely = os.path.join(lonely_dir, "test.m3u8")
+    shutil.copyfile(playlist, lonely)
+    app.src_files = [lonely]
+    miss_err = t.validate()
+    check("分片缺失时报错点名缺失文件", bool(miss_err) and "seg0.ts" in miss_err,
+          str(miss_err).replace("\n", " / "))
+    app.src_files = [a]
+    wrong_err = t.validate()
+    check("第一个文件不是 m3u8 时给出可操作的提示",
+          bool(wrong_err) and "首尾拼接" in wrong_err, str(wrong_err).replace("\n", " / "))
+    os.remove(lonely)
+    os.rmdir(lonely_dir)
+
+    # AES-128 加密分片：密钥文件通常叫 *.key，不在 ffmpeg 默认的扩展名白名单里，
+    # 不加 -allowed_extensions ALL 会直接失败（实测）。
+    key = os.path.join(hls_dir, "enc.key")
+    with open(key, "wb") as fh:
+        fh.write(bytes(range(16)))
+    kinfo = os.path.join(hls_dir, "kinfo.txt")
+    with open(kinfo, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("enc.key\n" + key.replace("\\", "/") + "\n")
+    eplaylist = os.path.join(hls_dir, "enc.m3u8")
+    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", a,
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-force_key_frames", "expr:gte(t,n_forced*1)", "-c:a", "aac",
+                    "-hls_time", "1", "-hls_list_size", "0", "-hls_key_info_file", kinfo,
+                    "-hls_segment_filename", os.path.join(hls_dir, "enc%d.ts"), eplaylist],
+                   check=True, **popen_kwargs())
+    erep = probe_mod.playlist_report(eplaylist)
+    check("加密列表同样点清分片与密钥", erep["segments"] >= 2 and not erep["missing"],
+          f"{erep['segments']} 片，缺失 {erep['missing_total']}")
+    app.src_files = [eplaylist]
+    app.info = app.get_info(eplaylist)
+    run("m3u8 合成 AES-128 加密分片", t, "38_hls_enc.mp4", src=eplaylist)
+    os.remove(key)
+    app.src_files = [eplaylist]
+    key_err = t.validate()
+    check("密钥文件丢失时提前点名", bool(key_err) and "enc.key" in key_err,
+          str(key_err).replace("\n", " / "))
+    with open(key, "wb") as fh:
+        fh.write(bytes(range(16)))
+
+    t.hls_mode.set("reencode")
+    t._on_hls_mode()
+    t.venc.set("libx264")
+    t.crf.set("30")
+    t.preset.set("ultrafast")
+    t.aenc.set("aac")
+    app.src_files = [playlist]
+    run("m3u8 兼容合成（重新编码）", t, "39_hls_reencode.mp4", src=playlist)
+    t.hls_mode.set("copy")
+    t._on_hls_mode()
+    t.container.set("保持原格式")
+
+    app.src_files = [a, b]
+    app._refresh_src_list()
+    app.info = app.get_info(a)
+    for tab in app.tabs:
+        tab.on_src_changed()
+
     # ---- 7. 截图 ----
     t = tabs["CaptureTab"]
     run("截图 单帧", t, "20_frame.jpg",
@@ -816,6 +930,32 @@ def main():
     overlaps = layout_overlaps()
     check("各功能页布局无控件重叠", not overlaps,
           "; ".join(overlaps[:3]) if overlaps else f"{len(app.tabs)} 个页面全部正常")
+
+    # 合并页每个操作一块参数区，上面的检查看不到区内的排版；
+    # 而且 grid_remove 的隐藏块仍然带着 grid_info，所以只看「已映射」的控件。
+    mt = tabs["MergeTab"]
+    mt.operation.set("m3u8 合成 · 播放列表 / 分片合成一个视频")
+    mt._on_operation()
+    hls_bad = []
+    for mode in ("copy", "reencode"):
+        mt.hls_mode.set(mode)
+        mt._on_hls_mode()
+        app.update()
+        rows: dict[int, list] = {}
+        for child in mt.hls_box.winfo_children():
+            if not child.winfo_ismapped():
+                continue
+            gi = child.grid_info()
+            col = int(gi.get("column", 0))
+            rows.setdefault(int(gi.get("row", 0)), []).append(
+                (col, col + max(1, int(gi.get("columnspan", 1))) - 1, child.winfo_class()))
+        for row, items in rows.items():
+            for i in range(len(items)):
+                for j in range(i + 1, len(items)):
+                    if items[i][0] <= items[j][1] and items[j][0] <= items[i][1]:
+                        hls_bad.append(f"{mode} 第{row}行 {items[i][2]}与{items[j][2]}")
+    check("m3u8 参数区两种合成方式下排版都不重叠", not hls_bad,
+          "; ".join(hls_bad[:3]) if hls_bad else "copy / reencode 均正常")
 
     # ---- 14. 关闭窗口（内部会 destroy，之后不再使用 app）----
     close_error = ""

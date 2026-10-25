@@ -7,7 +7,7 @@ import re
 import tkinter as tk
 from tkinter import ttk
 
-from core import builder
+from core import builder, probe
 from core.util import local_temp_dir
 from .. import widgets
 from .base import BaseTab
@@ -16,6 +16,7 @@ from .subform import SubForm
 # 操作类型：(键, 说明)
 OPERATIONS = [
     ("concat", "首尾拼接 · 把多个视频接成一段"),
+    ("hls", "m3u8 合成 · 播放列表 / 分片合成一个视频"),
     ("mux", "音视频合并 · 画面来自 A，声音来自 B"),
     ("multitrack", "多音轨封装 · 多个文件的音轨合进一个文件"),
     ("side", "并排同屏 · 两个视频左右 / 上下同屏"),
@@ -49,7 +50,9 @@ class MergeTab(BaseTab):
     name = "合并 / 拼接"
     hint = ("把多个视频接成一段时，默认「直接拼接」不重新编码，只复制视频流与音频流，"
             "秒级完成且画质无损；只有各段分辨率或编码不一致时，才需要改用「兼容拼接」。"
-            "拼接顺序就是主界面文件列表的顺序（可用 ↑ ↓ 调整）。")
+            "拼接顺序就是主界面文件列表的顺序（可用 ↑ ↓ 调整）。\n"
+            "下载站常见的 .m3u8 也在这里合成：选「m3u8 合成」，把播放列表 + 分片变成一个"
+            "普通视频文件（支持 AES-128 加密分片），播放列表放在主界面文件列表的第一位。")
     accept = "video"
     suffix = "_merged"
 
@@ -75,6 +78,10 @@ class MergeTab(BaseTab):
         self.transition = tk.StringVar(value="fade")
         self.transition_on = tk.BooleanVar(value=False)
         self.transition_dur = tk.StringVar(value="1.0")
+        self._venc_cbs: list[ttk.Combobox] = []
+
+        # m3u8 合成
+        self.hls_mode = tk.StringVar(value="copy")         # copy / reencode
 
         # 音视频合并
         self.audio_file = tk.StringVar(value="")
@@ -119,6 +126,24 @@ class MergeTab(BaseTab):
         box.columnconfigure(1, weight=1)
         return box
 
+    def _encode_rows(self, g: SubForm):
+        """视频 / 音频编码两行——兼容拼接与 m3u8 兼容合成共用同一组设置。"""
+        row = g.field("视频编码")
+        venc_cb = ttk.Combobox(row, textvariable=self.venc, values=["libx264"],
+                               width=15, state="readonly")
+        venc_cb.grid(row=0, column=0, sticky="w")
+        self._venc_cbs.append(venc_cb)
+        ttk.Label(row, text="CRF", style="PanelMuted.TLabel").grid(row=0, column=1, padx=(13, 4))
+        ttk.Entry(row, textvariable=self.crf, width=5).grid(row=0, column=2, sticky="w")
+        ttk.Label(row, text="速度", style="PanelMuted.TLabel").grid(row=0, column=3, padx=(13, 4))
+        ttk.Combobox(row, textvariable=self.preset, values=builder.PRESETS, width=11,
+                     state="readonly").grid(row=0, column=4, sticky="w")
+        row = g.field("音频编码")
+        ttk.Combobox(row, textvariable=self.aenc, values=AUDIO_ENCODERS, width=13,
+                     state="readonly").grid(row=0, column=0, sticky="w")
+        ttk.Label(row, text="码率", style="PanelMuted.TLabel").grid(row=0, column=1, padx=(13, 4))
+        ttk.Entry(row, textvariable=self.abr, width=8).grid(row=0, column=2, sticky="w")
+
     def _build_boxes(self):
         # ---------------- 首尾拼接 ----------------
         self.concat_box = self._new_box()
@@ -142,20 +167,7 @@ class MergeTab(BaseTab):
         rg = SubForm(self.rec_box)
         rg.combo("统一分辨率", self.resolution, [r[0] for r in RESOLUTIONS], width=24)
         rg.combo("统一帧率", self.fps, FPS_CHOICES, width=24)
-        row = rg.field("视频编码")
-        self.venc_cb = ttk.Combobox(row, textvariable=self.venc, values=["libx264"],
-                                    width=15, state="readonly")
-        self.venc_cb.grid(row=0, column=0, sticky="w")
-        ttk.Label(row, text="CRF", style="PanelMuted.TLabel").grid(row=0, column=1, padx=(13, 4))
-        ttk.Entry(row, textvariable=self.crf, width=5).grid(row=0, column=2, sticky="w")
-        ttk.Label(row, text="速度", style="PanelMuted.TLabel").grid(row=0, column=3, padx=(13, 4))
-        ttk.Combobox(row, textvariable=self.preset, values=builder.PRESETS, width=11,
-                     state="readonly").grid(row=0, column=4, sticky="w")
-        row = rg.field("音频编码")
-        ttk.Combobox(row, textvariable=self.aenc, values=AUDIO_ENCODERS, width=13,
-                     state="readonly").grid(row=0, column=0, sticky="w")
-        ttk.Label(row, text="码率", style="PanelMuted.TLabel").grid(row=0, column=1, padx=(13, 4))
-        ttk.Entry(row, textvariable=self.abr, width=8).grid(row=0, column=2, sticky="w")
+        self._encode_rows(rg)
 
         # 转场（整块显隐）
         self.trans_block = ttk.Frame(self.rec_box, style="Panel.TFrame")
@@ -173,6 +185,34 @@ class MergeTab(BaseTab):
             row=0, column=2, sticky="w")
         ttk.Label(self.trans_row, text="秒（需小于最短片段的长度）",
                   style="PanelMuted.TLabel").grid(row=0, column=3, padx=(4, 0))
+
+        # ---------------- m3u8 合成 ----------------
+        self.hls_box = self._new_box()
+        g = SubForm(self.hls_box)
+        row = g.field("播放列表")
+        ttk.Label(row, text="主界面已选的第一个 .m3u8 文件",
+                  style="PanelMuted.TLabel").grid(row=0, column=0, sticky="w")
+        row = g.field("合成方式")
+        ttk.Radiobutton(row, text="直接合成（复制视频流 + 音频流，不重新编码）",
+                        value="copy", variable=self.hls_mode,
+                        command=self._on_hls_mode).grid(row=0, column=0, sticky="w")
+        row = g.field("")
+        ttk.Radiobutton(row, text="兼容合成（重新编码，分片编码不一致或要改格式时用）",
+                        value="reencode", variable=self.hls_mode,
+                        command=self._on_hls_mode).grid(row=0, column=0, sticky="w")
+
+        self.hls_rec_box = ttk.Frame(self.hls_box, style="Panel.TFrame")
+        self.hls_rec_box.grid(row=g.row, column=0, columnspan=2, sticky="ew")
+        self.hls_rec_box.columnconfigure(1, weight=1)
+        g.row += 1
+        self._encode_rows(SubForm(self.hls_rec_box))
+
+        g.note("m3u8 只是播放列表，画面数据都在同目录的分片（.ts / .m4s）里，"
+               "所以「合成」是把列表指向的分片按顺序装进一个普通视频文件，"
+               "默认不重新编码、画质无损、几秒钟完成；输出格式建议 mp4 或 mkv。\n"
+               "AES-128 加密的直播回放也支持，但密钥文件必须和列表、分片放在一起。"
+               "只有本地路径会被检查，网络分片需要联网读取。\n"
+               "如果目录里只有一堆 .ts 而没有列表，请改用「首尾拼接」把所有分片按顺序加进主界面。")
 
         # ---------------- 音视频合并 ----------------
         self.mux_box = self._new_box()
@@ -217,6 +257,7 @@ class MergeTab(BaseTab):
 
         self._boxes = {
             "concat": self.concat_box,
+            "hls": self.hls_box,
             "mux": self.mux_box,
             "multitrack": self.mt_box,
             "side": self.side_box,
@@ -242,8 +283,13 @@ class MergeTab(BaseTab):
             self.container_cb.configure(state="readonly")
             if self.container.get() == "mkv" and getattr(self, "_container_before_mt", None):
                 self.container.set(self._container_before_mt)
-            self.order_holder.grid()
+            # m3u8 合成只用列表里的第一个文件，摆「将按此顺序处理全部文件」会误导
+            if op == "hls":
+                self.order_holder.grid_remove()
+            else:
+                self.order_holder.grid()
         self._on_join_mode()
+        self._on_hls_mode()
         self.notify_output_changed()
 
     def _on_join_mode(self):
@@ -252,6 +298,12 @@ class MergeTab(BaseTab):
         else:
             self.rec_box.grid_remove()
         self._on_transition()
+
+    def _on_hls_mode(self):
+        if self.hls_mode.get() == "reencode":
+            self.hls_rec_box.grid()
+        else:
+            self.hls_rec_box.grid_remove()
 
     def _on_transition(self):
         if self.join_mode.get() == "reencode" and self.transition_on.get():
@@ -276,8 +328,11 @@ class MergeTab(BaseTab):
                     "h264_qsv", "h264_amf"):
             if enc in self.app.encoders:
                 values.append(enc)
-        if values and hasattr(self, "venc_cb"):
-            self.venc_cb.configure(values=values)
+        # 「兼容拼接」和「m3u8 兼容合成」各有一行编码选择，绑的是同一组变量，
+        # 所以要全部刷新，只留一个引用会让另一个停在旧列表上。
+        if values and self._venc_cbs:
+            for cb in self._venc_cbs:
+                cb.configure(values=values)
             if self.venc.get() not in values:
                 self.venc.set(values[0])
         self._refresh_order()
@@ -299,11 +354,13 @@ class MergeTab(BaseTab):
     def output_ext(self) -> str:
         v = self.container.get()
         if v == "保持原格式":
-            return self.app.src_ext() or "mp4"
+            ext = self.app.src_ext() or "mp4"
+            # m3u8 是播放列表不是容器，「保持原格式」对它没有意义
+            return "mp4" if ext in ("m3u8", "m3u") else ext
         return v
 
     def output_suffix(self) -> str:
-        return {"concat": "_merged", "mux": "_muxed",
+        return {"concat": "_merged", "hls": "_merged", "mux": "_muxed",
                 "multitrack": "_multitrack", "side": "_sidebyside"}[self._op_key()]
 
     def expected_duration(self, src: str) -> float | None:
@@ -386,6 +443,28 @@ class MergeTab(BaseTab):
                 shortest = min(durations)
                 if dur >= shortest:
                     return f"转场时长必须小于最短片段的长度（{shortest:.2f} 秒）。"
+        elif op == "hls":
+            files = self.app.src_files
+            if not files:
+                return "请先在主界面选择 .m3u8 播放列表文件。"
+            playlist = files[0]
+            if not probe.is_hls_playlist(playlist):
+                return (f"第一个文件不是 m3u8 播放列表：{os.path.basename(playlist)}\n"
+                        "请把 .m3u8 放在文件列表第一位；"
+                        "如果只有一堆 .ts 分片没有列表，请改用「首尾拼接」。")
+            if not os.path.isfile(playlist):
+                return f"播放列表不存在：{playlist}"
+            rep = probe.playlist_report(playlist)
+            if rep["error"]:
+                return rep["error"]
+            if not (rep["segments"] or rep["variants"]):
+                return "播放列表里没有分片（可能还没下载完，或者它不是媒体播放列表）。"
+            if rep["missing"]:
+                names = "、".join(os.path.basename(p) for p in rep["missing"])
+                more = (f" 等 {rep['missing_total']} 个文件"
+                        if rep["missing_total"] > len(rep["missing"]) else "")
+                return (f"播放列表引用的文件找不到：{names}{more}\n"
+                        "分片和加密密钥都必须与 .m3u8 放在同一个目录里才能合成。")
         elif op == "mux":
             if not self.app.src_files:
                 return "请先在主界面选择提供画面的视频文件。"
@@ -414,6 +493,8 @@ class MergeTab(BaseTab):
         op = self._op_key()
         if op == "concat":
             return self._build_concat(src, dst)
+        if op == "hls":
+            return self._build_hls(src, dst)
         if op == "mux":
             return self._build_mux(src, dst)
         if op == "multitrack":
@@ -589,6 +670,23 @@ class MergeTab(BaseTab):
     def _duration(self, path) -> float:
         info = self.app.get_info(path)
         return float(info.duration) if info and info.duration else 0.0
+
+    # ============================================================== m3u8 合成
+    def _build_hls(self, src: str, dst: str) -> list[str]:
+        """把播放列表指向的分片合成成一个普通视频文件。
+
+        输入参数必须排在 ``-i`` 之前才作用到这个输入上。
+        复制流时不要手动加 ``-bsf:a aac_adtstoasc``：ffmpeg 会为 MP4 自动补，
+        而音频不是 AAC（mp3 / ac3）的列表写了它反而打不开输出文件。
+        """
+        args = list(probe.HLS_INPUT_ARGS) + ["-i", src]
+        if self.hls_mode.get() == "reencode":
+            args += self._video_encode_args() + self._audio_encode_args()
+        else:
+            args += ["-c", "copy"]
+        if self.output_ext() in ("mp4", "mov"):
+            args += ["-movflags", "+faststart"]
+        return args + [dst]
 
     # ========================================================== 音视频合并
     def _build_mux(self, src: str, dst: str) -> list[str]:

@@ -106,6 +106,80 @@ def ffmpeg_version(ffmpeg_path: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# HLS 播放列表（.m3u8）
+# --------------------------------------------------------------------------
+# ffmpeg 对播放列表引用外部文件有两道默认闸门：协议必须在白名单内，
+# 被引用文件的扩展名必须在「常见多媒体扩展名」清单里。三个坑实测：
+#   * 加密分片的密钥常叫 enc.key —— 不在扩展名清单，报
+#     "Filename extension of 'x.key' is not a common multimedia extension"；
+#   * 不加 crypto 协议时同一份加密列表直接 "Invalid data found"；
+#   * 分片走 http(s) 时不加 http 协议则读不到任何流。
+# 三个参数都属于「输入选项」，必须排在 -i 之前才会作用到输入上。
+HLS_INPUT_ARGS = ["-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                  "-allowed_extensions", "ALL"]
+_HLS_EXTS = (".m3u8", ".m3u")
+_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+_URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
+
+
+def is_hls_playlist(path) -> bool:
+    """按扩展名判断是否为 HLS 播放列表（m3u8 只是清单，不含任何画面数据）。"""
+    return os.path.splitext(str(path or ""))[1].lower() in _HLS_EXTS
+
+
+def hls_input_args(path) -> list[str]:
+    """是播放列表时返回需要插在 ``-i`` 之前的参数，否则返回空表。"""
+    return list(HLS_INPUT_ARGS) if is_hls_playlist(path) else []
+
+
+def playlist_report(path: str) -> dict:
+    """读本地播放列表，统计分片数并检查它引用的本地文件是否都在。
+
+    m3u8 只是清单，分片、AES-128 密钥、fMP4 的 init 段都得躺在同一目录；
+    少一个时 ffmpeg 只会丢一句含糊的错误（甚至算出个空文件），
+    所以这里提前点名。远程 URI 不做本地检查。
+    """
+    rep = {"segments": 0, "variants": 0, "missing": [], "missing_total": 0, "error": ""}
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+            text = fh.read()
+    except OSError as exc:
+        rep["error"] = f"无法读取播放列表：{exc}"
+        return rep
+
+    base = os.path.dirname(os.path.abspath(path))
+
+    def check(uri: str):
+        if not uri or _SCHEME_RE.match(uri):
+            return
+        local = uri if os.path.isabs(uri) else os.path.join(base, uri.replace("/", os.sep))
+        if not os.path.isfile(local):
+            rep["missing_total"] += 1
+            if len(rep["missing"]) < 3:
+                rep["missing"].append(local)
+
+    pending_stream = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-STREAM-INF"):
+            pending_stream = True          # 下一行是子列表（多码率主列表）
+            continue
+        if line.startswith("#"):
+            for uri in _URI_ATTR_RE.findall(line):   # EXT-X-KEY / EXT-X-MAP
+                check(uri)
+            continue
+        check(line)
+        if pending_stream:
+            rep["variants"] += 1
+            pending_stream = False
+        else:
+            rep["segments"] += 1
+    return rep
+
+
+# --------------------------------------------------------------------------
 # 媒体信息
 # --------------------------------------------------------------------------
 def _fraction(value) -> float:
@@ -319,6 +393,7 @@ def count_packets(ffprobe_path: str, path: str, timeout: int = 30) -> dict:
     """
     cmd = [
         ffprobe_path, "-v", "error", "-hide_banner",
+        *hls_input_args(path),
         "-print_format", "json",
         "-show_streams", "-count_packets",
         "-i", path,
@@ -347,6 +422,7 @@ def probe(ffprobe_path: str, path: str, timeout: int = 30) -> MediaInfo:
     """调用 ffprobe 读取媒体信息（失败抛出 RuntimeError）。"""
     cmd = [
         ffprobe_path, "-v", "error", "-hide_banner",
+        *hls_input_args(path),
         "-print_format", "json",
         "-show_format", "-show_streams",
         "-i", path,

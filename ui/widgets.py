@@ -303,10 +303,12 @@ def ask_open_files(parent, patterns, multiple=True, initialdir=None):
 
 
 VIDEO_TYPES = [("视频文件", "*.mp4 *.mkv *.mov *.avi *.flv *.wmv *.webm *.ts *.m4v *.mpg *.mpeg *.3gp *.rmvb *.vob *.ogv"),
+               ("m3u8 播放列表", "*.m3u8 *.m3u"),
                ("音频文件", "*.mp3 *.aac *.wav *.flac *.ogg *.opus *.m4a *.wma *.ac3 *.ape")]
 AUDIO_TYPES = [("音频文件", "*.mp3 *.aac *.wav *.flac *.ogg *.opus *.m4a *.wma *.ac3 *.ape"),
                ("视频文件", "*.mp4 *.mkv *.mov *.avi *.flv *.wmv *.webm *.ts")]
-MEDIA_TYPES = [("媒体文件", "*.mp4 *.mkv *.mov *.avi *.flv *.wmv *.webm *.ts *.m4v *.mp3 *.aac *.wav *.flac *.ogg *.opus *.m4a"),
+MEDIA_TYPES = [("媒体文件", "*.mp4 *.mkv *.mov *.avi *.flv *.wmv *.webm *.ts *.m4v *.m3u8 *.mp3 *.aac *.wav *.flac *.ogg *.opus *.m4a"),
+               ("m3u8 播放列表", "*.m3u8 *.m3u"),
                ("视频文件", "*.mp4 *.mkv *.mov *.avi *.flv *.wmv *.webm *.ts *.m4v"),
                ("音频文件", "*.mp3 *.aac *.wav *.flac *.ogg *.opus *.m4a *.wma"),
                ("图片文件", "*.jpg *.jpeg *.png *.bmp *.webp *.gif *.tif")]

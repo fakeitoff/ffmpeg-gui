@@ -21,6 +21,7 @@ from .tabs import TAB_CLASSES
 MEDIA_EXTS = {
     ".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".ts", ".m4v", ".mpg",
     ".mpeg", ".3gp", ".rmvb", ".vob", ".ogv", ".rm", ".mts", ".m2ts", ".f4v",
+    ".m3u8", ".m3u",
     ".mp3", ".aac", ".wav", ".flac", ".ogg", ".opus", ".m4a", ".wma", ".ac3", ".ape",
     ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff",
 }
