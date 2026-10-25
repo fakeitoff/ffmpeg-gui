@@ -60,6 +60,9 @@ class MergeTab(BaseTab):
     def build(self):
         self._list_content = ""
         self._aux_files: list[str] = []
+        # 输出名改过一次，清单文件名就跟着变；旧的那些要一路记着才能删干净
+        # （只记「当前这一个」会让改名预览留下的清单永远躺在 temp/ 里）。
+        self._list_paths: set[str] = set()
         self._container_before_mt = CONTAINERS[0]
         f = self.form
 
@@ -416,12 +419,13 @@ class MergeTab(BaseTab):
         return list(self._aux_files)
 
     def cleanup(self):
-        for path in self._aux_files:
+        for path in list(self._aux_files) + sorted(self._list_paths):
             try:
                 os.remove(path)
             except OSError:
                 pass
         self._aux_files = []
+        self._list_paths.clear()
         self._list_content = ""
 
     # ------------------------------------------------------------------
@@ -529,6 +533,7 @@ class MergeTab(BaseTab):
         stem = os.path.splitext(os.path.basename(dst))[0] or "concat"
         stem = re.sub(r"[^\w\u4e00-\u9fff\-]+", "_", stem)[:48] or "concat"
         path = os.path.join(local_temp_dir(), f"concat_{stem}.txt")
+        self._list_paths.add(path)
 
         lines = []
         for p in sources:

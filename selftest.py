@@ -74,7 +74,11 @@ def main():
         return 1
     print(f"ffmpeg = {ffmpeg}\n")
 
-    tmp = tempfile.mkdtemp(prefix="ffgui_test_")
+    # 测试素材同样只写程序目录的 temp/ 下（不碰系统盘临时目录）；
+    # 用唯一子目录避免多次运行互相踩，跑完删除，万一崩溃则由程序启动时
+    # 按 12 小时年龄回收 temp/ 里的遗留物。
+    scratch_root = local_temp_dir()
+    tmp = tempfile.mkdtemp(prefix="ffgui_test_", dir=scratch_root)
     print(f"测试目录：{tmp}\n")
     a, b, logo, sub, subbed = make_samples(ffmpeg, tmp)
     check("生成测试素材", os.path.exists(a) and os.path.exists(b) and os.path.exists(logo)
@@ -450,18 +454,27 @@ def main():
 
     local_temp = local_temp_dir()
     glob_pattern = os.path.join(local_temp, "*")
-    before_files = set(glob.glob(glob_pattern))
+    # 只数文件：测试素材此刻就放在 temp/ 的子目录里，不应被算成「新增的临时文件」
+    def temp_files():
+        return {p for p in glob.glob(glob_pattern) if os.path.isfile(p)}
+
+    before_files = temp_files()
     cmd_first = t.build_cmd(a, probe_dst)
     for _ in range(8):
         cmd_last = t.build_cmd(a, probe_dst)
-    after_files = set(glob.glob(glob_pattern))
+    after_files = temp_files()
     check("拼接命令预览稳定（清单路径不变）", cmd_first == cmd_last, " ".join(cmd_first))
     check("反复生成命令不新增临时文件",
           after_files == before_files and len(after_files) == 1,
-          f"{len(before_files)} -> {len(after_files)} 个")
+          f"{len(before_files)} -> {len(after_files)} 个 · " +
+          "、".join(os.path.basename(p) for p in sorted(after_files)))
     check("临时文件位于程序目录 temp/ 下（不使用系统盘临时目录）",
           os.path.normcase(local_temp) == os.path.normcase(os.path.join(ROOT, "temp")),
           local_temp)
+    check("自检素材目录也在程序 temp/ 之下",
+          os.path.normcase(os.path.abspath(tmp)).startswith(
+              os.path.normcase(os.path.abspath(local_temp)) + os.sep),
+          tmp)
 
     e = tabs["EffectsTab"]
     e.operation.set("文字水印")
@@ -781,8 +794,15 @@ def main():
             pv = app._last_preview
             return bool(pv) and "ffmpeg" in pv.lower() and not pv.startswith("正在")
 
+        # ttk 把「指针掠过按钮」也报成 active，所以判可点击 = 不是 disabled
+        def btn_ready():
+            return str(app.btn_start.cget("state")) != "disabled"
+
+        # runner 线程是先写 results、再把 finished 投进队列的：中途有一瞬
+        # 「线程已结束 + 预览已恢复」但按钮还没被 finished 点亮，
+        # 所以两项都要等到位为止，不能只等预览。
         recovery = _time.time() + 6
-        while _time.time() < recovery and not preview_back():
+        while _time.time() < recovery and not (preview_back() and btn_ready()):
             pump(0.15)
 
         all_ok = bool(app.runner.results) and all(r[1] for r in app.runner.results)
@@ -791,8 +811,8 @@ def main():
         check(f"第 {tag} 次执行：runner 已结束", app._runner_busy() is False)
         check(f"第 {tag} 次执行：预览恢复为真实命令行", preview_back(),
               app._last_preview[:64])
-        check(f"第 {tag} 次执行：开始按钮恢复可用",
-              str(app.btn_start.cget("state")) == "normal")
+        check(f"第 {tag} 次执行：开始按钮恢复可用", btn_ready(),
+              str(app.btn_start.cget("state")))
 
     run_cycle(1)
     run_cycle(2)
@@ -964,6 +984,11 @@ def main():
     except Exception as exc:  # noqa: BLE001
         close_error = str(exc)
     check("窗口可正常关闭（含关闭时的临时文件清理）", not close_error, close_error)
+    # 关窗后 temp/ 里不该留下任何本次运行的痕迹（改名预览产生的清单尤其容易漏）
+    leftovers = [os.path.basename(p) for p in glob.glob(glob_pattern)
+                 if os.path.isfile(p)]
+    check("关闭后程序 temp/ 不残留本次产生的临时文件", not leftovers,
+          "、".join(leftovers[:4]))
 
     # ---- 清理测试残留 ----
     import shutil
