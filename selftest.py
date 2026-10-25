@@ -783,6 +783,12 @@ def main():
           app.out_path.get().endswith("index_merged.mkv")
           and "将保存到" in str(app.out_hint.cget("text")),
           f"{app.out_path.get()} ｜ {str(app.out_hint.cget('text'))[:40]}")
+    t.hls_ua.set("")
+    t._use_browser_ua()
+    check("「浏览器 UA」填的是真实浏览器串（服务端就吃这套）",
+          t.hls_ua.get().startswith("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+          and "Edg/156" in t.hls_ua.get(), t.hls_ua.get()[:68])
+    t.hls_ua.set(UA_TAG)
     err = t.validate()
     check("在线地址通过校验", err is None, str(err))
     dl_dir = os.path.join(tmp, "dl")
@@ -1135,15 +1141,24 @@ def main():
     check("runner 状态查询不抛异常", app._runner_busy() in (True, False))
 
     def run_cycle(tag):
+        preset_before = ct.preset.get()
         app.on_start()
-        seen_running = False
+        locked_cmd = ""
+        locked_title = ""
+        moved_during_run = ""
         deadline = _time.time() + 90
         while _time.time() < deadline:
             pump(0.15)
-            if app._last_preview.startswith("正在执行"):
-                seen_running = True
+            if not locked_cmd and app._running_cmd:
+                locked_cmd = app._last_preview
+                locked_title = app.cmd_title.get()
+                # 执行中动一下参数：预览必须纹丝不动，锁的是「真在跑的那条命令」
+                ct.preset.set("fast" if preset_before != "fast" else "slower")
+                app._refresh_preview_text()
+                moved_during_run = app._last_preview
             if app.runner.results:
                 break
+        ct.preset.set(preset_before)
         pump(0.4)
 
         def preview_back():
@@ -1162,11 +1177,16 @@ def main():
             pump(0.15)
 
         all_ok = bool(app.runner.results) and all(r[1] for r in app.runner.results)
-        check(f"第 {tag} 次执行：过程中显示「正在执行」", seen_running)
+        check(f"第 {tag} 次执行：预览显示真在跑的命令且改参数也不刷新",
+              bool(locked_cmd) and "ffmpeg" in locked_cmd.lower()
+              and locked_cmd == moved_during_run and "已锁定" in locked_title,
+              f"锁定 {len(locked_cmd)} 字符 · 改参数后{'不变' if locked_cmd == moved_during_run else '被刷新'}")
         check(f"第 {tag} 次执行：任务全部成功（{len(app.runner.results)} 个）", all_ok)
         check(f"第 {tag} 次执行：runner 已结束", app._runner_busy() is False)
         check(f"第 {tag} 次执行：预览恢复为真实命令行", preview_back(),
               app._last_preview[:64])
+        check(f"第 {tag} 次执行：结束后标题解除「锁定」提示",
+              app.cmd_title.get() == "命令行预览", app.cmd_title.get())
         check(f"第 {tag} 次执行：开始按钮恢复可用", btn_ready(),
               str(app.btn_start.cget("state")))
 

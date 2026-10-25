@@ -362,7 +362,7 @@ class MergeTab(BaseTab):
 
     # ---------------- m3u8：在线地址 / 录制 ----------------
     BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                  "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0")
 
     def _remote_target(self) -> str:
         """在线地址（去首尾空格）；没填返回空串。"""

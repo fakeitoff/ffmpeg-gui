@@ -110,6 +110,8 @@ class App(tk.Tk):
         self._encoders: set[str] | None = None
         self._font_path: str = ""
         self._last_preview = ""
+        self.cmd_title = tk.StringVar(value="命令行预览")
+        self._running_cmd = ""      # 执行中锁定的那条命令（预览用它，不随选项刷新）
         self._last_output_dir = ""
         self._log_buffer: list[tuple[str, str]] = []
         self._log_dirty = False
@@ -404,7 +406,8 @@ class App(tk.Tk):
         head = ttk.Frame(parent, style="Panel.TFrame")
         head.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
         head.columnconfigure(1, weight=1)
-        ttk.Label(head, text="命令行预览", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(head, textvariable=self.cmd_title, style="Section.TLabel").grid(
+            row=0, column=0, sticky="w")
         ttk.Label(head, text="  （随选项实时更新，可复制后自行使用）",
                   style="PanelMuted.TLabel").grid(row=0, column=1, sticky="w")
         ttk.Label(head, text="日志级别", style="PanelMuted.TLabel").grid(row=0, column=2, padx=(0, 4))
@@ -746,25 +749,32 @@ class App(tk.Tk):
     def _refresh_preview_text(self):
         """重算并显示命令行预览。任何异常都不应影响界面其它逻辑。"""
         try:
-            tab = self.current_tab()
-            if tab is not None and tab.runnable:
-                src = tab.src_override or (self.src_files[0] if self.src_files else "<源文件>")
-                dst = self.resolve_output(src, tab) if self.src_files else "<输出文件>"
-                try:
-                    args = tab.build_cmd(src, dst)
-                    # 预览要跟真实执行一致，包括「是否覆盖同名文件」
-                    cmd = Job(src, dst, args).preview(
-                        self.ffmpeg_path or "ffmpeg", self.log_level.get(),
-                        self.overwrite.get())
-                except Exception as exc:  # noqa: BLE001
-                    cmd = f"（参数暂不完整：{exc}）"
-            elif tab is not None:
-                cmd = "（当前页面不执行转码）"
+            busy = self._runner_busy()
+            if busy and not self._running_cmd:
+                # 任务刚点下去、job_start 还没回到主线程的极短窗口
+                self.cmd_title.set("命令行预览（正在启动…）")
+                cmd = "正在启动…"
+            elif busy:
+                self.cmd_title.set("命令行预览（执行中 · 已锁定，不随选项刷新）")
+                cmd = self._running_cmd
             else:
-                cmd = ""
-            # 任务执行中不覆盖预览，改为提示（执行中的完整命令已打印在日志里）
-            if self._runner_busy():
-                cmd = "正在执行…（命令行已在上方日志中输出）"
+                self.cmd_title.set("命令行预览")
+                tab = self.current_tab()
+                if tab is not None and tab.runnable:
+                    src = tab.src_override or (self.src_files[0] if self.src_files else "<源文件>")
+                    dst = self.resolve_output(src, tab) if self.src_files else "<输出文件>"
+                    try:
+                        args = tab.build_cmd(src, dst)
+                        # 预览要跟真实执行一致，包括「是否覆盖同名文件」
+                        cmd = Job(src, dst, args).preview(
+                            self.ffmpeg_path or "ffmpeg", self.log_level.get(),
+                            self.overwrite.get())
+                    except Exception as exc:  # noqa: BLE001
+                        cmd = f"（参数暂不完整：{exc}）"
+                elif tab is not None:
+                    cmd = "（当前页面不执行转码）"
+                else:
+                    cmd = ""
             if cmd != self._last_preview:
                 self._last_preview = cmd
                 self.cmd_text.configure(state="normal")
@@ -1029,8 +1039,13 @@ class App(tk.Tk):
                     self._apply_progress(event[1])
                 elif kind == "job_start":
                     idx, job = event[1], event[2]
+                    # 锁定预览为「此刻真正在跑的那条命令」：执行期间用户可能继续点选项，
+                    # 预览跟着变会让人以为「我改的东西已经生效在这次执行里」，其实没有。
+                    self._running_cmd = job.preview(self.ffmpeg_path, self.log_level.get(),
+                                                    self.runner.overwrite)
                     self.status_text.set(
-                        f"[{idx + 1}/{self.runner.jobs.__len__()}] 正在处理 {os.path.basename(job.src)}")
+                        f"[{idx + 1}/{len(self.runner.jobs)}] 正在处理 {os.path.basename(job.src)}")
+                    self._refresh_preview_text()
                 elif kind == "job_done":
                     job, ok, msg = event[2], event[3], event[4]
                     if ok:
@@ -1115,6 +1130,7 @@ class App(tk.Tk):
             partial = any(ok_one for _dst, ok_one, _m in results)
             self.log(f"■ {msg}", "warn" if partial else "error")
         self.status_text.set(msg)
+        self._running_cmd = ""      # 解锁：之后预览重新跟随当前选项实时算
         self._last_preview = ""
         self._flush_log()
         # 任务刚结束，立即把预览恢复成真实命令行，不必等下一轮轮询
