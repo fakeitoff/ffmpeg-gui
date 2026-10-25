@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -87,9 +88,10 @@ def main():
     # ---- 构造 GUI（隐藏窗口）----
     from ui.app import App
 
-    # 日志也落在程序 temp/ 的素材目录里，不污染仓库的 log/
+    # 日志与偏好也落在程序 temp/ 的素材目录里，不污染仓库的 log/ 与 settings.json
     log_dir = os.path.join(tmp, "log")
-    app = App(initial_files=[a, b], log_dir=log_dir)
+    settings_file = os.path.join(tmp, "settings.json")
+    app = App(initial_files=[a, b], log_dir=log_dir, settings_file=settings_file)
     app.withdraw()
     app.update()
 
@@ -1330,6 +1332,57 @@ def main():
                         hls_bad.append(f"{mode} 第{row}行 {items[i][2]}与{items[j][2]}")
     check("m3u8 参数区两种合成方式下排版都不重叠", not hls_bad,
           "; ".join(hls_bad[:3]) if hls_bad else "copy / reencode 均正常")
+
+    # ---- 13b. 顶部高度、折叠与偏好记忆（用户抱怨「每次都要手动拖」）----
+    s = app.ui_scale
+    app.update_idletasks()
+    open_h = app.card.winfo_reqheight()
+    check("顶部默认高度封顶，不再吃掉大半屏", open_h <= 150 * s,
+          f"{open_h}px（上限 {int(150 * s)}px，缩放 {s:.2f}）")
+    app._toggle_card()
+    app.update_idletasks()
+    shut_h = app.card.winfo_reqheight()
+    check("顶部能一键折叠，折叠后只剩一两行", shut_h * 2 < open_h,
+          f"{open_h}px → {shut_h}px")
+    app._toggle_card()
+    app.update_idletasks()
+    check("展开后恢复原来的高度", app.card.winfo_reqheight() > shut_h,
+          f"{shut_h}px → {app.card.winfo_reqheight()}px")
+    check("折叠时头部那行仍能看出文件数与输出目标",
+          "源文件 2 个" in app._card_head.get() and "→" in app._card_head.get(),
+          app._card_head.get())
+    check("正文用封顶滚动容器，超出可以滚轮看",
+          type(app.card_body).__name__ == "VScrollBox"
+          and int(str(app.card_body.canvas.cget("height"))) <= app.card_body.max_height,
+          f"canvas={app.card_body.canvas.cget('height')} ≤ {app.card_body.max_height}")
+    frac = app._current_sash_fraction()
+    check("分隔条默认位置给日志留出空间（不超过约 0.6）", 0.3 <= frac <= 0.6, str(frac))
+    for raw, want in (("0.75", 0.75), ("5", 0.85), ("0.01", 0.30), ("坏值", 0.56)):
+        app._prefs["sash"] = raw
+        got = app._sash_fraction()
+        if abs(got - want) > 1e-6:
+            break
+    check("偏好里的分隔条位置被采用，异常值夹回安全范围",
+          abs(got - want) <= 1e-6, f"{raw} → {got}")
+    app._prefs["sash"] = 0.56
+    app._prefs["geometry"] = "99999x99999+50000+50000"
+    geo = app._initial_geometry()
+    m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", geo)
+    check("旧屏幕上记住的尺寸换屏后会被夹回屏内（不会出现拖不回来的窗口）",
+          bool(m) and int(m.group(1)) <= app.winfo_screenwidth()
+          and int(m.group(3)) <= app.winfo_screenwidth() - 100, geo)
+    app._prefs["geometry"] = ""
+    app._save_prefs()
+    from core import settings as settings_mod
+
+    saved = settings_mod.load(settings_file)
+    check("关闭时记住窗口尺寸 / 分隔条位置 / 顶部折叠状态",
+          {"geometry", "sash", "card_open"} <= set(saved)
+          and saved["sash"] == app._current_sash_fraction(), str(sorted(saved)))
+    with open(settings_file, "w", encoding="utf-8") as fh:
+        fh.write("{ 这不是合法 JSON")
+    check("偏好文件坏了也只当没有偏好，不影响使用",
+          settings_mod.load(settings_file) == {})
 
     # ---- 14. 关闭窗口（内部会 destroy，之后不再使用 app）----
     close_error = ""

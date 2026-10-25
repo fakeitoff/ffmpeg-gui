@@ -504,3 +504,30 @@ class ScrollFrame(ttk.Frame):
             delta = int(-event.delta / 120)
         self.canvas.yview_scroll(delta, "units")
 
+
+class VScrollBox(ScrollFrame):
+    """高度封顶的滚动容器：内容矮就贴合内容，内容高就封顶并可滚。
+
+    顶部「源文件 / 输出位置」用它压住默认高度——否则控件一多就把中间的
+    参数区挤成一条，用户每次开窗口都要拖分隔条。滚动条只在真放不下时出现。
+    """
+
+    def __init__(self, master, max_height: int, bg: str = theme.PANEL):
+        super().__init__(master, bg=bg)
+        self.max_height = max(48, int(max_height))
+        self.canvas.configure(height=self.max_height)
+        self.inner.bind("<Configure>", self._fit, add="+")
+        self.canvas.bind("<Configure>", self._fit, add="+")
+
+    def _fit(self, _event=None):
+        try:
+            need = self.inner.winfo_reqheight()
+            self.canvas.configure(height=min(need, self.max_height))
+            overflow = need > self.max_height + 1
+            if overflow and not self.vsb.winfo_ismapped():
+                self.vsb.grid(row=0, column=1, sticky="ns")
+            elif not overflow and self.vsb.winfo_ismapped():
+                self.vsb.grid_remove()
+        except tk.TclError:
+            pass
+

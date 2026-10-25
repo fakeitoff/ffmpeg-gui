@@ -16,3 +16,6 @@ log/
 .idea/
 .vscode/
 *.swp
+
+# 界面偏好（窗口尺寸 / 分隔条位置 / 顶部折叠），删掉即回默认
+settings.json

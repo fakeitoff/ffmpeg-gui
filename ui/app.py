@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from core import probe as probe_mod
+from core import settings
 from core.logfile import RunLog
 from core.probe import FFmpegNotFound, locate
 from core.runner import Job, JobRunner, LOG_LEVELS
@@ -64,10 +66,15 @@ def _detect_ui_scale(root) -> float:
 class App(tk.Tk):
     """主窗口。"""
 
-    def __init__(self, initial_files=None, initial_tab=None, log_dir=None):
+    def __init__(self, initial_files=None, initial_tab=None, log_dir=None,
+                 settings_file=None):
         _enable_dpi_awareness()      # 必须早于 Tk 初始化
         super().__init__()
         self._setup_dpi()
+        # 用户每次都要手动调的那几项（窗口大小、分隔条位置、顶部是否折叠）
+        # 记住并还原；读写失败一律当没有偏好，不能因此打不开界面。
+        self._settings_file = settings_file or settings.default_path()
+        self._prefs = settings.load(self._settings_file)
         self.title("FFmpeg GUI —— 常用视频音频处理工具箱")
         self.geometry(self._initial_geometry())
         self.minsize(int(880 * self.ui_scale), int(560 * self.ui_scale))
@@ -112,7 +119,6 @@ class App(tk.Tk):
         self.out_path = tk.StringVar(value="")
         self.overwrite = tk.BooleanVar(value=True)
         self.status_text = tk.StringVar(value="就绪")
-        self.src_summary = tk.StringVar(value="尚未选择文件")
         self.percent_text = tk.StringVar(value="0.0%")
 
         self._build_ui()
@@ -173,7 +179,11 @@ class App(tk.Tk):
             pass
 
     def _initial_geometry(self) -> str:
-        """按屏幕大小自适应窗口尺寸，避免在小屏上被裁切。"""
+        """按屏幕大小自适应窗口尺寸，避免在小屏上被裁切。
+
+        用户自己调过的尺寸优先还原，但必须夹在屏幕范围内——
+        换过显示器或分辨率后旧值可能整块跑到屏幕外，那种窗口是拖不回来的。
+        """
         s = self.ui_scale
         try:
             sw = self.winfo_screenwidth()
@@ -181,10 +191,21 @@ class App(tk.Tk):
         except tk.TclError:
             return f"{int(1180 * s)}x{int(880 * s)}"
         # 小屏（如 1366×768 / 1536×864）上按可用空间收缩，避免溢出屏幕
-        w = min(int(1180 * s), sw - int(50 * s))
-        h = min(int(880 * s), sh - int(80 * s))
-        w = max(w, int(820 * s))
-        h = max(h, int(520 * s))
+        min_w, min_h = int(820 * s), int(520 * s)
+        max_w, max_h = sw - int(50 * s), sh - int(80 * s)
+        saved = str(self._prefs.get("geometry", ""))
+        m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", saved)
+        if m:
+            w = min(max(int(m.group(1)), min_w), max(max_w, min_w))
+            h = min(max(int(m.group(2)), min_h), max(max_h, min_h))
+            # 位置只保证标题栏在屏幕上（左上角可见），其余交给窗口管理器
+            x = min(max(int(m.group(3)), 0), max(sw - int(160 * s), 0))
+            y = min(max(int(m.group(4)), 0), max(sh - int(80 * s), 0))
+            return f"{w}x{h}+{x}+{y}"
+        w = min(int(1180 * s), max_w)
+        h = min(int(880 * s), max_h)
+        w = max(w, min_w)
+        h = max(h, min_h)
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 3)
         return f"{w}x{h}+{x}+{y}"
@@ -213,7 +234,8 @@ class App(tk.Tk):
         paned.add(bottom, weight=2)
         self._build_bottom(bottom)
 
-        # 首次显示时把分隔条放到 62% 的位置，保证选项区与日志区都有合理空间
+        # 首次显示时把分隔条放到 56% 的位置：参数区够一屏看完，
+        # 下面的日志也有一眼能读几行的空间（原来 62% 日志只剩两行）。
         self._sash_done = False
         paned.bind("<Configure>", self._place_sash)
 
@@ -223,10 +245,29 @@ class App(tk.Tk):
         try:
             h = self.paned.winfo_height()
             if h > 240:
-                self.paned.sashpos(0, int(h * 0.62))
+                frac = self._sash_fraction()
+                self.paned.sashpos(0, int(h * frac))
                 self._sash_done = True
         except tk.TclError:
             pass
+
+    def _sash_fraction(self) -> float:
+        """参数区占整个中部区域的比例：优先用户上次拖到的位置。"""
+        try:
+            frac = float(self._prefs.get("sash", 0.56))
+        except (TypeError, ValueError):
+            return 0.56
+        return min(max(frac, 0.30), 0.85)
+
+    def _current_sash_fraction(self) -> float:
+        try:
+            h = self.paned.winfo_height()
+            pos = self.paned.sashpos(0)
+            if h > 240 and 0 < pos < h:
+                return round(pos / h, 4)
+        except tk.TclError:
+            pass
+        return self._sash_fraction()
 
     # ------------------------------------------------------------------
     def _build_topbar(self):
@@ -248,15 +289,34 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------
     def _build_source_card(self):
-        card = ttk.Frame(self, style="Card.TFrame", padding=(12, 10))
-        card.grid(row=1, column=0, sticky="ew", padx=10, pady=(8, 0))
+        card = ttk.Frame(self, style="Card.TFrame", padding=(12, 6))
+        card.grid(row=1, column=0, sticky="ew", padx=10, pady=(6, 0))
         card.columnconfigure(1, weight=1)
+        self.card = card
 
-        # -- 源文件 --
-        ttk.Label(card, text="源文件", style="Panel.TLabel", font=(theme.FONT, 10, "bold")).grid(
+        # ---- 头部一行：概要 + 折叠 ----
+        # 折叠后整块只剩这一行，把空间全部让给中间的参数区；
+        # 「源文件几个、要输出成什么」在这行就看得见，不用展开。
+        self._card_head = tk.StringVar(value="尚未选择文件")
+        ttk.Label(card, textvariable=self._card_head, style="Panel.TLabel",
+                  font=(theme.FONT, 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.card_open = tk.BooleanVar(value=bool(self._prefs.get("card_open", True)))
+        self.card_btn = ttk.Button(card, style="Ghost.TButton", width=9,
+                                   command=self._toggle_card)
+        self.card_btn.grid(row=0, column=1, sticky="e")
+
+        # ---- 可滚动的正文：高度封顶，控件多 / 屏幕窄 / 缩放大时滚动，
+        # 而不是把中间参数区挤成一条 ----
+        self.card_body = widgets.VScrollBox(card, widgets.scaled(card, 96))
+        self.card_body.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        inner = self.card_body.inner
+        inner.columnconfigure(1, weight=1)
+        self._sync_card()
+
+        # -- 源文件（列表与按钮并同一行，省一行高度）--
+        ttk.Label(inner, text="源文件", style="Panel.TLabel").grid(
             row=0, column=0, sticky="nw", padx=(0, 10))
-
-        src_box = ttk.Frame(card, style="Panel.TFrame")
+        src_box = ttk.Frame(inner, style="Panel.TFrame")
         src_box.grid(row=0, column=1, sticky="ew")
         src_box.columnconfigure(0, weight=1)
 
@@ -274,47 +334,67 @@ class App(tk.Tk):
         self.src_list.configure(yscrollcommand=sb.set)
 
         btns = ttk.Frame(src_box, style="Panel.TFrame")
-        btns.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        btns.grid(row=0, column=1, sticky="e", padx=(8, 0))
         for text, cmd, width in (("添加文件…", self.pick_files, 10),
                                  ("添加文件夹…", self.pick_folder, 11),
-                                 ("移除选中", self.remove_selected, 10),
-                                 ("清空", self.clear_files, 7),
+                                 ("移除", self.remove_selected, 6),
+                                 ("清空", self.clear_files, 6),
                                  ("↑", self.move_up, 3),
                                  ("↓", self.move_down, 3)):
             ttk.Button(btns, text=text, command=cmd, width=width).pack(side="left", padx=(0, 4))
 
-        self.src_info = ttk.Label(src_box, textvariable=self.src_summary,
-                                  style="PanelMuted.TLabel")
-        self.src_info.grid(row=2, column=0, sticky="w", pady=(5, 0))
-
-        # -- 输出 --
-        ttk.Label(card, text="输出位置", style="Panel.TLabel", font=(theme.FONT, 10, "bold")).grid(
-            row=1, column=0, sticky="nw", padx=(0, 10), pady=(12, 0))
-
-        out_box = ttk.Frame(card, style="Panel.TFrame")
-        out_box.grid(row=1, column=1, sticky="ew", pady=(12, 0))
+        # -- 输出（第一行：模式 + 覆盖；第二行：路径 + 浏览；第三行：说明）--
+        ttk.Label(inner, text="输出位置", style="Panel.TLabel").grid(
+            row=1, column=0, sticky="nw", padx=(0, 10), pady=(7, 0))
+        out_box = ttk.Frame(inner, style="Panel.TFrame")
+        out_box.grid(row=1, column=1, sticky="ew", pady=(7, 0))
         out_box.columnconfigure(0, weight=1)
 
-        radios = ttk.Frame(out_box, style="Panel.TFrame")
-        radios.grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Radiobutton(radios, text="源文件同目录，自动命名", value="auto",
+        head_row = ttk.Frame(out_box, style="Panel.TFrame")
+        head_row.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(head_row, text="源文件同目录，自动命名", value="auto",
                         variable=self.out_mode, command=self._on_out_mode).pack(side="left")
-        ttk.Radiobutton(radios, text="指定位置", value="custom",
-                        variable=self.out_mode, command=self._on_out_mode).pack(side="left", padx=(16, 0))
+        ttk.Radiobutton(head_row, text="指定位置", value="custom",
+                        variable=self.out_mode, command=self._on_out_mode).pack(
+            side="left", padx=(14, 0))
+        ttk.Checkbutton(head_row, text="覆盖同名文件", variable=self.overwrite).pack(
+            side="left", padx=(16, 0))
 
         self.out_entry = ttk.Entry(out_box, textvariable=self.out_path)
-        self.out_entry.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.out_entry.grid(row=1, column=0, sticky="ew", pady=(5, 0))
         self.out_browse = ttk.Button(out_box, text="浏览…", width=8, command=self._pick_output)
-        self.out_browse.grid(row=1, column=1, padx=(6, 0), pady=(6, 0))
+        self.out_browse.grid(row=1, column=1, padx=(6, 0), pady=(5, 0))
 
         self.out_hint = ttk.Label(out_box, text="", style="PanelMuted.TLabel")
-        self.out_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
-        ttk.Checkbutton(out_box, text="覆盖已存在的同名文件（不勾选时遇到同名文件会中止）",
-                        variable=self.overwrite).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.out_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
         self._on_out_mode()
+
+    # ------------------------------------------------------------------
+    def _toggle_card(self):
+        self.card_open.set(not self.card_open.get())
+        self._sync_card()
+
+    def _sync_card(self):
+        """折叠/展开：折起来只剩一行，正文整块不占高度。"""
+        if self.card_open.get():
+            self.card_body.grid()
+            self.card_btn.configure(text="收起 ▲")
+        else:
+            self.card_body.grid_remove()
+            self.card_btn.configure(text="展开 ▼")
+        self._update_card_head()
+
+    def _update_card_head(self):
+        count = len(self.src_files)
+        if not count:
+            self._card_head.set("尚未选择文件")
+            return
+        target = os.path.basename(self.out_path.get().strip())
+        text = f"源文件 {count} 个" + ("（批量）" if count > 1 else "")
+        if target:
+            text += f"　→　{target}"
+        self._card_head.set(text)
 
     # ------------------------------------------------------------------
     def _build_bottom(self, parent):
@@ -335,7 +415,7 @@ class App(tk.Tk):
         ttk.Button(head, text="清空日志", style="Ghost.TButton",
                    command=self._clear_log).grid(row=0, column=5, padx=(4, 0))
 
-        self.cmd_text = tk.Text(parent, height=3, wrap="word", bg="#fbfbfc", fg=theme.ACCENT,
+        self.cmd_text = tk.Text(parent, height=2, wrap="word", bg="#fbfbfc", fg=theme.ACCENT,
                                 relief="solid", borderwidth=1, font=(theme.MONO, 9),
                                 padx=8, pady=5, state="disabled")
         self.cmd_text.grid(row=1, column=0, sticky="ew", padx=12)
@@ -478,14 +558,8 @@ class App(tk.Tk):
         self.src_list.delete(0, "end")
         for path in self.src_files:
             self.src_list.insert("end", path)
-        count = len(self.src_files)
-        if count == 0:
-            self.src_summary.set("尚未选择文件")
+        if not self.src_files:
             self.info = None
-        else:
-            self.src_summary.set(f"共 {count} 个文件" + ("（将批量处理）" if count > 1 else ""))
-        if count > 1 and self.out_mode.get() == "auto":
-            pass  # 自动命名天然支持批量
         self._probe_first()
         self.refresh_auto_output()
         for tab in self.tabs:
@@ -543,6 +617,7 @@ class App(tk.Tk):
 
     def _reset_out_hint(self):
         """底部那行说明。在线地址别只说「落在 downloads/」，把真实文件名一并亮出来。"""
+        self._update_card_head()      # 折叠时头部那行就是唯一的入口信息
         dst = self._remote_target(self.current_tab())
         if dst:
             self.out_hint.configure(
@@ -1065,6 +1140,7 @@ class App(tk.Tk):
                 except Exception:
                     pass
                 setattr(self, attr, None)
+        self._save_prefs()
         self._cleanup_tabs()
         try:
             self.run_log.write("窗口关闭", "dim")
@@ -1074,6 +1150,18 @@ class App(tk.Tk):
         try:
             super().destroy()
         except tk.TclError:
+            pass
+
+    def _save_prefs(self):
+        """记下窗口尺寸 / 分隔条位置 / 顶部是否折叠——这三样正是每次都要手动调的。"""
+        try:
+            self._prefs.update({
+                "geometry": self.geometry(),
+                "sash": self._current_sash_fraction(),
+                "card_open": bool(self.card_open.get()),
+            })
+            settings.save(self._prefs, self._settings_file)
+        except Exception:
             pass
 
     # ------------------------------------------------------------------
