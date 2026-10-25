@@ -764,13 +764,23 @@ def main():
           ((no_ua.stderr or b"").decode("utf-8", "replace").strip().splitlines() or [""])[-1][:90])
 
     t = tabs["MergeTab"]
+    app.notebook.select(app.tabs.index(t))    # 落点显示只看「当前页」，得先切到合并页
+    app._on_tab_changed()
+    t.container.set("保持原格式")
     t.operation.set("m3u8 合成 · 播放列表 / 分片合成一个视频")
     t._on_operation()
-    t.hls_url.set(URL)
+    check("本地 m3u8 不劫持容器（仍是「保持原格式」）",
+          t.container.get() == "保持原格式", t.container.get())
+    t.hls_url.set(URL)                     # 这一填要自动把容器和落点亮出来
     t.hls_ua.set(UA_TAG)
     t.hls_refer.set("http://127.0.0.1/")
-    t.container.set("mkv")
     t.hls_record.set("")
+    check("填了在线地址自动选中 mkv（实测只有它支持边下边播、被硬杀也能播）",
+          t.container.get() == "mkv", t.container.get())
+    check("顶部「输出位置」随地址自动更新，不用用户去找落点",
+          app.out_path.get().endswith("index_merged.mkv")
+          and "将保存到" in str(app.out_hint.cget("text")),
+          f"{app.out_path.get()} ｜ {str(app.out_hint.cget('text'))[:40]}")
     err = t.validate()
     check("在线地址通过校验", err is None, str(err))
     dl_dir = os.path.join(tmp, "dl")
@@ -848,6 +858,29 @@ def main():
           "完成" in body or "已手动停止" in body,
           body.rstrip().splitlines()[-1][:80] if body.strip() else "(空)")
     t.hls_record.set("")
+
+    t.hls_reconnect.set("5")
+    cmd_r = t.build_cmd(URL, os.path.join(tmp, "shape_r.mkv"))
+    check("重连参数按用户填的退避秒数下发（reconnect + streamed + delay_max）",
+          cmd_r[cmd_r.index("-reconnect") + 1] == "1"
+          and cmd_r[cmd_r.index("-reconnect_streamed") + 1] == "1"
+          and cmd_r[cmd_r.index("-reconnect_delay_max") + 1] == "5",
+          " ".join(cmd_r[:14]))
+    t.hls_reconnect.set("")
+    cmd_d = t.build_cmd(URL, os.path.join(tmp, "shape_d.mkv"))
+    check("重连等待留空走默认 30 秒",
+          cmd_d[cmd_d.index("-reconnect_delay_max") + 1]
+          == str(probe_mod.HLS_RECONNECT_DEFAULT),
+          cmd_d[cmd_d.index("-reconnect_delay_max") + 1])
+    rerr_bad = []
+    for value in ("0", "-3", "abc", "99999"):
+        t.hls_reconnect.set(value)
+        msg = t.validate() or ""
+        if "重连" not in msg:
+            rerr_bad.append(f"{value}→{msg[:26]}")
+    t.hls_reconnect.set("")
+    check("非法重连等待（0 / 负数 / 非数字 / 超上限）都被拦下", not rerr_bad,
+          "; ".join(rerr_bad))
 
     t.hls_record.set("2")
     cmd_t = t.build_cmd(URL, os.path.join(tmp, "shape_t.mkv"))
@@ -942,6 +975,15 @@ def main():
     web.shutdown()
     app.out_mode.set(_mode_before)
     app.out_path.set(_path_before)
+    t.hls_url.set("")
+    check("清空在线地址后，自动选的 mkv 还原成「保持原格式」",
+          t.container.get() == "保持原格式", t.container.get())
+    t.hls_url.set(URL)
+    t.container.set("mp4")                 # 用户显式改过
+    t.operation.set("首尾拼接 · 把多个视频接成一段")
+    t._on_operation()
+    check("用户显式选过的容器不会被自动逻辑改回去",
+          t.container.get() == "mp4", t.container.get())
     t.hls_url.set("")
     t.hls_ua.set("")
     t.hls_refer.set("")

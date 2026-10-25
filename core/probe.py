@@ -120,11 +120,35 @@ HLS_BASE_ARGS = ["-protocol_whitelist", HLS_PROTOCOL_WHITELIST,
                  "-allowed_extensions", "ALL"]
 # 断线重连只对 http(s) 协议存在：和本地列表混着传，ffmpeg 会直接
 # "Option not found" 退出（实测），所以网络参数必须按输入是不是在线地址来加。
-HLS_NETWORK_ARGS = ["-reconnect", "1", "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "30"]
+# reconnect_streamed 是「流读到一半断了也重新接上」，直播录制必须有它。
+HLS_RECONNECT_DEFAULT = 30
+HLS_RECONNECT_MAX = 3600
+_HLS_RECONNECT_BASE = ["-reconnect", "1", "-reconnect_streamed", "1"]
 _HLS_EXTS = (".m3u8", ".m3u")
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 _URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
+
+
+def reconnect_delay_seconds(value, default: int = HLS_RECONNECT_DEFAULT):
+    """把界面填的重连等待解析成秒；非法返回 None 由调用方报错。"""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return float(default)
+    try:
+        secs = float(text)
+    except ValueError:
+        return None
+    if secs <= 0 or secs > HLS_RECONNECT_MAX:
+        return None
+    return secs
+
+
+def reconnect_args(delay=None) -> list[str]:
+    """重连参数；``delay`` 是退避上限秒数，留空用默认值。"""
+    secs = reconnect_delay_seconds(delay)
+    if secs is None:
+        secs = float(HLS_RECONNECT_DEFAULT)
+    return _HLS_RECONNECT_BASE + ["-reconnect_delay_max", f"{secs:g}"]
 
 
 def is_hls_playlist(path) -> bool:
@@ -141,14 +165,15 @@ def is_hls_playlist(path) -> bool:
     return os.path.splitext(text)[1].lower() in _HLS_EXTS
 
 
-def hls_input_args(path, user_agent: str = "", referer: str = "") -> list[str]:
+def hls_input_args(path, user_agent: str = "", referer: str = "",
+                   reconnect_delay=None) -> list[str]:
     """是播放列表时返回需要插在 ``-i`` 之前的参数，否则返回空表。"""
     if not is_hls_playlist(path):
         return []
     args = list(HLS_BASE_ARGS)
     if not is_http_url(path):
         return args
-    args += list(HLS_NETWORK_ARGS)
+    args += reconnect_args(reconnect_delay)
     if user_agent:
         args += ["-user_agent", user_agent]
     if referer:

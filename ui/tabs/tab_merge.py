@@ -61,10 +61,11 @@ class MergeTab(BaseTab):
     def build(self):
         self._list_content = ""
         self._aux_files: list[str] = []
+        # 我们替用户自动选过的容器（离开该操作时要还原成「保持原格式」）
+        self._auto_container = ""      # 我们替用户选过的容器，离开操作时还原
         # 输出名改过一次，清单文件名就跟着变；旧的那些要一路记着才能删干净
         # （只记「当前这一个」会让改名预览留下的清单永远躺在 temp/ 里）。
         self._list_paths: set[str] = set()
-        self._container_before_mt = CONTAINERS[0]
         f = self.form
 
         self.operation = tk.StringVar(value=OP_LABEL["concat"])
@@ -90,6 +91,7 @@ class MergeTab(BaseTab):
         self.hls_ua = tk.StringVar(value="")
         self.hls_refer = tk.StringVar(value="")
         self.hls_record = tk.StringVar(value="")           # 录制时长（秒）；空 = 一直录
+        self.hls_reconnect = tk.StringVar(value="")        # 重连退避上限（秒）；空 = 默认
         self._hls_info_cache: dict = {}
 
         # 音视频合并
@@ -201,7 +203,7 @@ class MergeTab(BaseTab):
         g = SubForm(self.hls_box)
         g.field_hint("在线地址", self.hls_url, width=58,
                      hint="http(s)://…/index.m3u8　填了就优先用它（下载 / 录制直播）")
-        self.hls_url.trace_add("write", lambda *_a: self._update_hls_tip())
+        self.hls_url.trace_add("write", lambda *_a: self._on_url_changed())
         row = g.field("防盗链 UA")
         ttk.Entry(row, textvariable=self.hls_ua, width=44).grid(row=0, column=0, sticky="w")
         ttk.Button(row, text="浏览器 UA", width=10,
@@ -209,6 +211,9 @@ class MergeTab(BaseTab):
         g.entry("Referer", self.hls_refer, width=58)
         g.field_hint("录制时长", self.hls_record, width=10,
                      hint="秒。留空 = 一直录到点「停止」（点播/已完成的直播不用填）")
+        g.field_hint("重连等待", self.hls_reconnect, width=10,
+                     hint="秒。断线后最长退避到这个时间再重连；留空按 "
+                          f"{probe.HLS_RECONNECT_DEFAULT} 秒")
         row = g.field("本地列表")
         ttk.Label(row, text="未填在线地址时，用主界面已选的第一个 .m3u8 文件",
                   style="PanelMuted.TLabel").grid(row=0, column=0, sticky="w")
@@ -236,8 +241,13 @@ class MergeTab(BaseTab):
         g.note("m3u8 只是播放列表，画面数据都在分片里：本地列表要求分片同目录，"
                "在线地址则由 ffmpeg 现取现拼，默认不重新编码、画质无损。\n"
                "在线列表常做防盗链：只认浏览器 UA / Referer，实测不带会被服务端 403 拒绝，"
-               "所以这两个框专门留出来（只发给 http(s) 输入，本地文件不能带这些参数）。"
-               "网络中断会自动重连。\n"
+               "所以这两个框专门留出来（只发给 http(s) 输入，本地文件不能带这些参数）。\n"
+               "断线会自动重试（「重连等待」是最长退避秒数），网络回来后**接着录后面的内容**；"
+               "但要说清楚：断掉那几秒的分片服务端已经翻过去了，取不回来，"
+               "实测结果是一个「中间缺几段」的短片，ffmpeg 仍会返回成功。"
+               "填了「录制时长」时看进度条有没有走满，就能判断有没有缺。\n"
+               "填了「录制时长」到点自动结束，没填就一直跟播，等你点「停止」"
+               "（停止会让 ffmpeg 写完文件尾，已录的部分都保留）。\n"
                "直播流（列表里没有 ENDLIST）会一直跟播：想停就点「停止」，"
                "程序会让 ffmpeg 自己收尾（实测 mp4 / mkv 都能完整退出、文件可播），"
                "已录下多少就存下多少。\n"
@@ -297,27 +307,41 @@ class MergeTab(BaseTab):
     def _op_key(self) -> str:
         return OP_KEY.get(self.operation.get(), "concat")
 
+    def _apply_container_default(self, op: str):
+        """「保持原格式」在这两种操作下没有意义，替用户挑一个真能用的容器。
+
+        多音轨必须 mkv（MP4 对多音轨与字幕支持差），所以直接锁住；
+        在线 m3u8 录制默认 mkv：实测只有它在「还在写」和「被硬杀」两种情况下
+        都打得开，mp4 的文件尾要等写完才存在。自动设的都在离开该操作时还原，
+        用户自己动过的选择一律不覆盖。
+        """
+        if self._auto_container and self.container.get() != self._auto_container:
+            self._auto_container = ""      # 用户已经改过，别再动他的选择
+        if self._auto_container:
+            self.container.set(CONTAINERS[0])
+            self._auto_container = ""
+        if op == "multitrack":
+            self._auto_container = "mkv"
+            self.container.set("mkv")
+            self.container_cb.configure(state="disabled")
+            return
+        self.container_cb.configure(state="readonly")
+        if op == "hls" and self._remote_target() and self.container.get() == CONTAINERS[0]:
+            self._auto_container = "mkv"
+            self.container.set("mkv")
+
     def _on_operation(self):
         for box in self._boxes.values():
             box.grid_remove()
         op = self._op_key()
         self._boxes[op].grid()
-
-        if op == "multitrack":
-            if self.container.get() != "mkv":
-                self._container_before_mt = self.container.get()
-            self.container.set("mkv")
-            self.container_cb.configure(state="disabled")
+        self._apply_container_default(op)
+        # m3u8 合成只用列表里的第一个文件（在线地址更是只有一个源），
+        # 摆「将按此顺序处理全部文件」会误导
+        if op in ("hls", "multitrack"):
             self.order_holder.grid_remove()
         else:
-            self.container_cb.configure(state="readonly")
-            if self.container.get() == "mkv" and getattr(self, "_container_before_mt", None):
-                self.container.set(self._container_before_mt)
-            # m3u8 合成只用列表里的第一个文件，摆「将按此顺序处理全部文件」会误导
-            if op == "hls":
-                self.order_holder.grid_remove()
-            else:
-                self.order_holder.grid()
+            self.order_holder.grid()
         self._on_join_mode()
         self._on_hls_mode()
         self.notify_output_changed()
@@ -355,6 +379,18 @@ class MergeTab(BaseTab):
     def _headers(self) -> tuple[str, str]:
         return (self.hls_ua.get().strip(), self.hls_refer.get().strip())
 
+    def _reconnect_delay(self):
+        """重连退避上限（秒）；返回 None 表示用户填的不是合法数字。"""
+        return probe.reconnect_delay_seconds(self.hls_reconnect.get())
+
+    def _on_url_changed(self):
+        """地址一填，容器和落点就得跟着变——这才是「所见即所存」。"""
+        if self._op_key() != "hls":
+            return
+        self._apply_container_default("hls")
+        self._update_hls_tip()
+        self.notify_output_changed()
+
     def _record_seconds(self) -> float:
         """录制时长上限。0 = 留空（一直录到手动停止），-1 = 填了但不是正数。"""
         text = self.hls_record.get().strip()
@@ -373,7 +409,7 @@ class MergeTab(BaseTab):
     def _hls_info(self, src: str):
         """带防盗链头去探测源，拿点播总时长与帧数（在线/本地列表都走这里）。"""
         ua, refer = self._headers()
-        args = probe.hls_input_args(src, ua, refer)
+        args = probe.hls_input_args(src, ua, refer, self._reconnect_delay())
         if not args:
             return self.app.get_info(src)
         key = (src, tuple(args))
@@ -593,6 +629,9 @@ class MergeTab(BaseTab):
                 return "录制时长要填正数（秒），或留空表示一直录到点「停止」。"
             url = self._remote_target()
             if url:
+                if self._reconnect_delay() is None:
+                    return (f"重连等待要填 1–{probe.HLS_RECONNECT_MAX} 之间的秒数，"
+                            f"留空则按默认 {probe.HLS_RECONNECT_DEFAULT} 秒。")
                 if not is_http_url(url):
                     return (f"在线地址只支持 http:// 或 https://，当前是：{url}\n"
                             "（其它前缀不能交给 ffmpeg 打开）")
@@ -838,7 +877,7 @@ class MergeTab(BaseTab):
         而音频不是 AAC（mp3 / ac3）的列表写了它反而打不开输出文件。
         """
         ua, refer = self._headers()
-        args = probe.hls_input_args(src, ua, refer) + ["-i", src]
+        args = probe.hls_input_args(src, ua, refer, self._reconnect_delay()) + ["-i", src]
         secs = self._record_seconds()
         if secs > 0:
             args += ["-t", f"{secs:g}"]        # 录制上限：到点自己停，进度条也按它算

@@ -532,19 +532,30 @@ class App(tk.Tk):
         state = "disabled" if auto else "normal"
         self.out_entry.configure(state=state)
         self.out_browse.configure(state=state)
-        if auto:
-            tab = self.current_tab()
-            if getattr(tab, "src_is_remote", False):
-                self.out_hint.configure(
-                    text="在线地址没有「源文件目录」，输出默认落在程序目录的 downloads/ 下；"
-                         "切到「指定输出目录」可以自己改。")
-            else:
-                self.out_hint.configure(text="输出文件将与源文件放在同一目录，文件名自动加处理后缀。")
+        self.refresh_auto_output()
+        self._reset_out_hint()
+
+    def _remote_target(self, tab) -> str:
+        """在线地址当前会写到的完整文件路径（只算不建目录，供展示）。"""
+        if tab is None or not getattr(tab, "src_is_remote", False) or not tab.src_override:
+            return ""
+        return self._remote_output(tab, tab.src_override, create=False)
+
+    def _reset_out_hint(self):
+        """底部那行说明。在线地址别只说「落在 downloads/」，把真实文件名一并亮出来。"""
+        dst = self._remote_target(self.current_tab())
+        if dst:
+            self.out_hint.configure(
+                text=f"在线地址将保存到：{dst}\n"
+                     "想换位置：切到「指定输出目录」并填一个已存在的目录；"
+                     "不填就落在程序目录的 downloads/ 下。")
+            return
+        if self.out_mode.get() == "auto":
+            self.out_hint.configure(text="输出文件将与源文件放在同一目录，文件名自动加处理后缀。")
         elif len(self.src_files) > 1:
             self.out_hint.configure(text="已选择多个文件：请填写一个【输出目录】。")
         else:
             self.out_hint.configure(text="可填写完整输出文件路径（含文件名与扩展名）。")
-        self.refresh_auto_output()
 
     def _pick_output(self):
         if len(self.src_files) > 1:
@@ -568,19 +579,22 @@ class App(tk.Tk):
         tab = self.current_tab()
         if tab is None:
             return
-        if getattr(tab, "src_is_remote", False) and tab.src_override:
+        dst = self._remote_target(tab)
+        if dst:
             # 只在这个框「自动」的时候回显落点；用户在「指定输出目录」里填的
             # 是目录，一旦被这个文件路径覆盖，落点判断就会被带偏。
             if self.out_mode.get() == "auto" or not self.out_path.get().strip():
-                self.out_path.set(self._remote_output(tab, tab.src_override))
+                self.out_path.set(dst)
+            self._reset_out_hint()
             return
         if self.out_mode.get() == "auto" and self.src_files:
             name = build_output_name(self.src_files[0], tab.output_suffix(), tab.output_ext())
             self.out_path.set(name)
         elif not self.out_path.get() and self.src_files:
             self.out_path.set(build_output_name(self.src_files[0], tab.output_suffix(), tab.output_ext()))
+        self._reset_out_hint()
 
-    def _remote_output(self, tab, url: str) -> str:
+    def _remote_output(self, tab, url: str, create: bool = True) -> str:
         """在线地址的输出落点。
 
         「与源文件同目录」对 URL 没有意义，所以固定落到程序目录的 ``downloads/``，
@@ -594,10 +608,11 @@ class App(tk.Tk):
             folder = os.path.join(APP_ROOT, "downloads")
         dst = os.path.join(folder,
                            f"{url_stem(url)}{tab.output_suffix()}.{tab.output_ext()}")
-        try:
-            ensure_dir(dst)      # ensure_dir 建的是这个「文件」的父目录，别传目录
-        except OSError:
-            pass                 # 建不出来（只读介质等）交给 ffmpeg 报错，别拖垮界面
+        if create:
+            try:
+                ensure_dir(dst)      # ensure_dir 建的是这个「文件」的父目录，别传目录
+            except OSError:
+                pass                 # 建不出来（只读介质等）交给 ffmpeg 报错，别拖垮界面
         return dst
 
     def resolve_output(self, src: str, tab) -> str:
