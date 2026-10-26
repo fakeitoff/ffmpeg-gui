@@ -17,6 +17,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 from core import probe as probe_mod                     # noqa: E402
+from core import runner as runner_mod                   # noqa: E402
 from core.probe import locate, probe                    # noqa: E402
 from core.runner import Job, JobRunner, Progress          # noqa: E402
 from core.util import (is_http_url, local_temp_dir, popen_kwargs, url_stem)        # noqa: E402
@@ -702,9 +703,10 @@ def main():
     os.makedirs(os.path.join(serve_dir, "vod"), exist_ok=True)
     UA_TAG = "ffgui-selftest"
     hits: list[tuple[str, str]] = []
+    gate = {"fail_after": None, "served": 0}
 
     class _Gate(http.server.BaseHTTPRequestHandler):
-        """只放行带测试 UA 的请求：403 / 200 的差别正是 User-Agent 参数存在的理由。"""
+        """只放行带测试 UA 的请求；gate.fail_after 之后一律 500（模拟断流）。"""
 
         def do_GET(self):
             hits.append((self.path, self.headers.get("User-Agent", "")))
@@ -717,6 +719,12 @@ def main():
             if not os.path.isfile(full):
                 self.send_response(404)
                 self.end_headers()
+                return
+            gate["served"] += 1
+            if gate["fail_after"] is not None and gate["served"] > gate["fail_after"]:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"down")
                 return
             data = open(full, "rb").read()
             self.send_response(200)
@@ -773,12 +781,21 @@ def main():
     t._on_operation()
     check("本地 m3u8 不劫持容器（仍是「保持原格式」）",
           t.container.get() == "保持原格式", t.container.get())
-    t.hls_url.set(URL)                     # 这一填要自动把容器和落点亮出来
-    t.hls_ua.set(UA_TAG)
+    t.hls_url.set(URL)                     # 这一填要自动把容器、UA 和落点亮出来
+    check("一粘在线地址就自动带上浏览器 UA（省一步，也免得直接吃 403）",
+          t.hls_ua.get() == t.BROWSER_UA and "Edg/156" in t.hls_ua.get(),
+          t.hls_ua.get()[:60])
+    t.hls_ua.set("my-own-ua")
+    t.hls_url.set(URL + "&t=2")
+    check("用户自己填过的 UA 不会被自动覆盖", t.hls_ua.get() == "my-own-ua", t.hls_ua.get())
+    t.hls_url.set(URL)
+    t.hls_ua.set(UA_TAG)                   # 本地服务只放行这个 UA
     t.hls_refer.set("http://127.0.0.1/")
     t.hls_record.set("")
     check("填了在线地址自动选中 mkv（实测只有它支持边下边播、被硬杀也能播）",
           t.container.get() == "mkv", t.container.get())
+    t.hls_url.set(URL)
+    t.hls_ua.set(UA_TAG)
     check("顶部「输出位置」随地址自动更新，不用用户去找落点",
           app.out_path.get().endswith("index_merged.mkv")
           and "将保存到" in str(app.out_hint.cget("text")),
@@ -866,6 +883,71 @@ def main():
           "完成" in body or "已手动停止" in body,
           body.rstrip().splitlines()[-1][:80] if body.strip() else "(空)")
     t.hls_record.set("")
+
+    # ---- 断流到底缺没缺：日志分类 + 统计（关键词都核对过 ffmpeg 8.1）----
+    sample_lines = [
+        "[in#0/hls @ 1] Opening 'https://h/325808077.m4s' for reading",
+        "[tls @ 2] Error in the push function.",
+        "[tls @ 3] IO error: Error number -10054 occurred",
+        "[in#0/hls @ 4] keepalive request failed for 'https://h/x.m4s' with error:"
+        " 'Error number -10054 occurred' when opening url, retrying with new connection",
+        "[mov,mp4,m4a,3gp,3g2,mj2 @ 5] Found duplicated MOOV Atom. Skipped it",
+        "[in#0/hls @ 6] Failed to open segment 78 of playlist 0",
+        "[in#0/hls @ 7] Segment not found, or is not a medium",
+        # 用户实际日志里的另一类：AV1 直播流把坏数据直接喂进来，hls 层看不出来
+        "[NULL @ 8] Failed to read unit 1 (type 3): Invalid data found when processing input.",
+        "[NULL @ 9] Failed to parse temporal unit.",
+    ]
+    kinds = [runner_mod.net_activity(l) for l in sample_lines]
+    check("可自愈的重连 / 真丢片 / 源数据损坏 三类分得开",
+          kinds == ["", "", "", "retry", "", "skip", "skip", "damage", "damage"], str(kinds))
+    check("「重复 MOOV 已跳过」不能被算成丢了一段（它只是丢掉重复的 init 头）",
+          runner_mod.net_activity(sample_lines[4]) == "")
+    check("传输层噪声单独判为可忽略（不标红）",
+          runner_mod.is_transient_noise(sample_lines[1])
+          and runner_mod.is_transient_noise(sample_lines[2])
+          and not runner_mod.is_transient_noise(sample_lines[5]))
+    check("统计文案把重连 / 丢片 / 损坏 / 落后写清楚，正常转码不打扰",
+          runner_mod.network_note(retries=3, lost=2, corrupt=4, lag=19.0)
+          == "媒体时间比预期少 00:00:19.0 · 疑似丢失 2 段 · 源数据损坏 4 处 · "
+             "重连 3 次（已自动接上）"
+          and runner_mod.network_note() == ""
+          and runner_mod.network_note(retries=1, lag=0.5) == "重连 1 次（已自动接上）",
+          runner_mod.network_note(retries=3, lost=2, corrupt=4, lag=19.0))
+    # 直播任务一切正常也要有回执：按了停止却什么都没看到，会被读成
+    # 「这功能没生效」（实测真发生过这样的误会）。
+    check("直播任务一切正常也给一份「没问题」回执",
+          runner_mod.network_note(force=True, recorded=216.0, wall=213.9)
+          == "已录 00:03:36.0 / 实际用时 00:03:33.9",
+          runner_mod.network_note(force=True, recorded=216.0, wall=213.9))
+    # 门槛得随录制长度走：建连 + 拉列表本来就有 2~3 秒，
+    # 按固定秒数判会让每场一小时的正常录制都误报「疑似缺」。
+    check("落后门槛随预期长度放大（长录制不因启动耗时误报）",
+          runner_mod.network_note(lag=3.0, base=3600.0) == ""
+          and "媒体时间比预期少" in runner_mod.network_note(lag=90.0, base=3600.0)
+          and "媒体时间比预期少" in runner_mod.network_note(lag=3.04, base=4.0),
+          runner_mod.network_note(lag=3.0, base=3600.0) + "|"
+          + runner_mod.network_note(lag=90.0, base=3600.0))
+
+    # 真断一次：源站在第 2 个文件之后一律 500，看统计能不能报出「疑似丢失」
+    gate["fail_after"] = 2
+    gate["served"] = 0
+    cut_dst = os.path.join(tmp, "43_cut.mkv")
+    cut_args = probe_mod.hls_input_args(URL, UA_TAG) + ["-i", URL, "-c", "copy", cut_dst]
+    seen_notes: list[str] = []
+    JobRunner([Job(URL, cut_dst, cut_args,
+                   duration=float(app.get_info(a).duration or 0.0))], ffmpeg, overwrite=True,
+              on_log=lambda line, kind="info", _s=seen_notes: _s.append(f"{kind}|{line}")).run()
+    gate["fail_after"] = None
+    gate["served"] = 0
+    stat_lines = [ln for ln in seen_notes if "网络统计" in ln]
+    check("断流被跳过的分片会被统计出来（不再只靠人看红字）",
+          bool(stat_lines) and ("疑似丢失" in stat_lines[-1] or "媒体时间比预期少" in stat_lines[-1]),
+          stat_lines[-1][:130] if stat_lines else f"(无统计行，日志 {len(seen_notes)} 行)")
+    retry_warns = [ln for ln in seen_notes if "retrying with new connection" in ln.lower()]
+    check("重连类日志降为黄色 warn（真错误才红色显眼）",
+          not retry_warns or all(ln.startswith("warn|") for ln in retry_warns),
+          [ln[:48] for ln in retry_warns][:1])
 
     t.hls_reconnect.set("5")
     cmd_r = t.build_cmd(URL, os.path.join(tmp, "shape_r.mkv"))
@@ -1204,6 +1286,17 @@ def main():
     check("时长已知：进度条随进度变化", v0 == 0 and abs(v1 - 42.0) < 0.01, f"{v0} → {v1}")
     check("时长已知：显示百分比", app.percent_text.get() == "42.0%", app.percent_text.get())
     check("时长已知：状态栏含已用时", "已用时" in app.status_text.get(), app.status_text.get())
+    # 回归：两个数原来精度不一样（00:00:41.0 / 00:00:41），看着像「不一致」；
+    # 现在一律一位小数，并且真的有差值时直接把「落后」写出来。
+    status_a = app.status_text.get()
+    check("已处理与已用时精度一致（不再一个带小数一个不带）",
+          "已处理 00:00:12.0" in status_a and "已用时 00:00:03.0" in status_a
+          and "落后" not in status_a, status_a)
+    app._apply_progress(Progress(job_total=1, percent=0.0, has_duration=False,
+                                 out_time=12.0, elapsed=15.0, speed="1.00x"))
+    status_b = app.status_text.get()
+    check("直播落后于墙钟时直接显示差值，不用用户心算",
+          "落后 00:00:03.0" in status_b, status_b)
     # 2) 时长未知：必须退化为滚动动画，不能冻在 0%
     app._apply_progress(Progress(job_total=1, percent=0.0, has_duration=False, elapsed=2.0))
     check("时长未知：切换为滚动动画", str(app.progress.cget("mode")) == "indeterminate",

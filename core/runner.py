@@ -15,6 +15,72 @@ GLOBAL_ARGS = ["-hide_banner", "-nostats", "-progress", "pipe:1"]
 
 LOG_LEVELS = ["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug"]
 
+# --------------------------------------------------------------------------
+# 网络直播源的日志分类
+# --------------------------------------------------------------------------
+# 直播源会把复用的连接重置掉（WSAECONNRESET / -10054），ffmpeg 自己换条连接重取，
+# 这类「正在自愈」的行原来按关键词判会被标成红色错误，真正的失败反而不显眼。
+# 下面的串都是在 ffmpeg 8.1 可执行文件里核对过的，不是凭印象写的。
+RETRY_HINTS = ("retrying with new connection", "keepalive request failed", "will reconnect")
+LOSS_HINTS = ("segment not found", "failed to open segment", "does not contain any stream")
+# 源把坏数据直接喂进来了（实测出现在 bilibili 的 AV1 直播流里：
+# 「Failed to read unit 1 (type 3): Invalid data found」+「Failed to parse temporal unit」）。
+# 这类不体现为 hls 层「取不到分片」，只数分片会漏掉，必须单独统计。
+DAMAGE_HINTS = ("invalid data found", "failed to parse", "failed to read unit",
+                "error while decoding", "corrupt")
+# 传输层噪声：本身不算丢内容，也不值得红色
+NOISE_HINTS = ("error in the push function", "error number -10054",
+               "connection reset by peer", "input/output error")
+
+
+def net_activity(line: str) -> str:
+    """把一行 ffmpeg 日志判为 ``"skip"`` / ``"damage"`` / ``"retry"`` / ``""``。
+
+    丢内容的判断优先，避免「Found duplicated MOOV Atom. Skipped it」这种
+    正常提示被算成丢了一段——它只是把重复的 init 头丢掉，画面一个字节没少。
+    """
+    low = str(line).lower()
+    if any(h in low for h in LOSS_HINTS):
+        return "skip"
+    if any(h in low for h in DAMAGE_HINTS):
+        return "damage"
+    if any(h in low for h in RETRY_HINTS):
+        return "retry"
+    return ""
+
+
+def is_transient_noise(line: str) -> bool:
+    """重连过程中的传输层报错：黄色提示即可，不必标红。"""
+    low = str(line).lower()
+    return any(h in low for h in NOISE_HINTS)
+
+
+def network_note(retries: int = 0, lost: int = 0, corrupt: int = 0, lag: float = 0.0,
+                 base: float = 0.0, force: bool = False, recorded: float = 0.0,
+                 wall: float = 0.0) -> str:
+    """把这次网络录制的健康状况压成一句人话。
+
+    ``force``（直播 / 时长未知的任务）时即使一切正常也要出一行：用户按了停止之后
+    「什么都没出现」会被当成「这功能没生效」，这里需要一份明确的「没问题」回执。
+    落后多少才算问题不能只看绝对值——建连 + 拉播放列表本来就要吃掉一两秒，
+    录一小时也还是这一两秒，按固定秒数判会让每次正常停止都冒「疑似缺」，
+    所以门槛取 ``max(2 秒, 预期的 1.5%)``。
+    """
+    from .util import format_time
+
+    parts = []
+    if force:
+        parts.append(f"已录 {format_time(recorded, 1)} / 实际用时 {format_time(wall, 1)}")
+    if lag and lag > max(2.0, (base or 0.0) * 0.015):
+        parts.append(f"媒体时间比预期少 {format_time(lag, 1)}")
+    if lost:
+        parts.append(f"疑似丢失 {lost} 段")
+    if corrupt:
+        parts.append(f"源数据损坏 {corrupt} 处")
+    if retries:
+        parts.append(f"重连 {retries} 次（已自动接上）")
+    return " · ".join(parts)
+
 
 @dataclass
 class Job:
@@ -201,6 +267,7 @@ class JobRunner(threading.Thread):
         progress_holder = {
             "out_time": 0.0, "speed": "", "fps": "", "frame": "", "frame_num": 0,
             "size": "", "started": time.time(), "pct": 0.0,
+            "retry": 0, "lost": 0, "corrupt": 0,
         }
 
         def pump_stderr():
@@ -212,7 +279,25 @@ class JobRunner(threading.Thread):
                     if not line.strip():
                         continue
                     low = line.lower()
-                    if "error" in low or "invalid" in low or "failed" in low or "no such" in low:
+                    act = net_activity(line)
+                    if act == "retry":
+                        # 正在自愈（换连接重取同一片）：黄色提示，而且**不能**进 errors，
+                        # 否则一次普通的连接重置会被当成失败原因贴到最终报告里。
+                        progress_holder["retry"] += 1
+                        self.on_log(line, "warn")
+                    elif act == "skip":
+                        progress_holder["lost"] += 1
+                        errors.append(line)
+                        self.on_log(line, "error")
+                    elif act == "damage":
+                        # 源直接喂进来了坏数据（AV1/HEVC 直播流实测）：不体现在
+                        # 「取不到分片」上，只数分片就会漏，所以单独计一项。
+                        progress_holder["corrupt"] += 1
+                        errors.append(line)
+                        self.on_log(line, "error")
+                    elif is_transient_noise(line):
+                        self.on_log(line, "warn")
+                    elif "error" in low or "invalid" in low or "failed" in low or "no such" in low:
                         errors.append(line)
                         self.on_log(line, "error")
                     elif "warning" in low or "deprecated" in low:
@@ -277,6 +362,38 @@ class JobRunner(threading.Thread):
         with self._lock:
             self._proc = None
 
+        # 「这次到底缺没缺」用客观量判断，不靠人读日志：
+        # 知道预期时长的（点播、填了录制时长的直播）拿预期比，
+        # 不知道的用墙钟比 —— 但只在「按实时前进」的源上才这么算，
+        # 否则一个 0.3x 的慢转码会被误报成落后一堆。
+        def lag_and_base() -> tuple[float, float]:
+            media = progress_holder["out_time"]
+            if job.duration and job.duration > 0:
+                return float(job.duration) - media, float(job.duration)
+            speed = str(progress_holder["speed"] or "").rstrip("xX").strip()
+            try:
+                if speed and float(speed) > 1.5:
+                    return 0.0, 0.0
+            except ValueError:
+                pass
+            wall = time.time() - progress_holder["started"]
+            return wall - media, wall
+
+        media = progress_holder["out_time"]
+        wall = time.time() - progress_holder["started"]
+        # 时长未知的任务（直播、探测失败）默认也要出一行：用户按了停止之后
+        # 「什么都没出现」会被读成「这功能没生效」，得给一份「没问题」的回执。
+        unknown = not (job.duration and job.duration > 0)
+        lag, base = lag_and_base()
+        note = network_note(retries=progress_holder["retry"], lost=progress_holder["lost"],
+                            corrupt=progress_holder["corrupt"], lag=lag, base=base,
+                            force=unknown, recorded=media, wall=wall)
+        if note:
+            level = "error" if (progress_holder["lost"] or progress_holder["corrupt"]) \
+                else ("warn" if (progress_holder["retry"] or lag > max(2.0, base * 0.015))
+                      else "info")
+            self.on_log(f"网络统计：{note}", level)
+
         if self._stop_event.is_set():
             # 「停止」是用户主动按的，已经写下的部分就是他要的成品
             # （录直播最常见的收尾方式）。ffmpeg 收到 q 会正常写完文件尾并返回 0，
@@ -286,7 +403,8 @@ class JobRunner(threading.Thread):
 
             size = os.path.getsize(job.dst) if os.path.isfile(job.dst) else 0
             if rc == 0 and size > 0:
-                return True, f"已手动停止 · 已保存 {human_size(size)}"
+                return True, (f"已手动停止 · 已保存 {human_size(size)}"
+                              + (f"（{note}）" if note else ""))
             try:
                 if os.path.exists(job.dst):
                     os.remove(job.dst)
@@ -302,7 +420,7 @@ class JobRunner(threading.Thread):
         if not self._output_ok(job, progress_holder.get("started", 0.0)):
             self._drop_empty_output(job)
             return False, "输出文件未生成或为空"
-        return True, "完成"
+        return True, "完成" + (f"（{note}）" if note else "")
 
     @staticmethod
     def _drop_empty_output(job: Job):

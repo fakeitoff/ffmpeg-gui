@@ -208,6 +208,8 @@ class MergeTab(BaseTab):
         ttk.Entry(row, textvariable=self.hls_ua, width=44).grid(row=0, column=0, sticky="w")
         ttk.Button(row, text="浏览器 UA", width=10,
                    command=self._use_browser_ua).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(row, text="填在线地址时自动带上", style="PanelMuted.TLabel").grid(
+            row=0, column=2, padx=(6, 0))
         g.entry("Referer", self.hls_refer, width=58)
         g.field_hint("录制时长", self.hls_record, width=10,
                      hint="秒。留空 = 一直录到点「停止」（点播/已完成的直播不用填）")
@@ -384,9 +386,13 @@ class MergeTab(BaseTab):
         return probe.reconnect_delay_seconds(self.hls_reconnect.get())
 
     def _on_url_changed(self):
-        """地址一填，容器和落点就得跟着变——这才是「所见即所存」。"""
+        """地址一填，容器、UA 和落点就得跟着变——这才是「所见即所存」。"""
         if self._op_key() != "hls":
             return
+        # 一粘地址就自动带上浏览器 UA：直播源几乎都拿它当最低门槛，
+        # 空着基本等于等着吃 403。用户自己填过的不动，清空重填才会再补。
+        if self._remote_target() and not self.hls_ua.get().strip():
+            self.hls_ua.set(self.BROWSER_UA)
         self._apply_container_default("hls")
         self._update_hls_tip()
         self.notify_output_changed()

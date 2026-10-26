@@ -1103,7 +1103,11 @@ class App(tk.Tk):
             parts.append(f"帧 {p.frame_num}/{p.total_frames}")
         else:
             parts.append(f"已处理 {format_time(p.out_time, 1)}")
-        parts.append(f"已用时 {format_time(p.elapsed, 0)}")
+        # 两个数一律同样精度，否则「00:00:41.0 / 00:00:41」看着就像不一致；
+        # 真不一致时直接把差值写出来，不用用户心算。
+        parts.append(f"已用时 {format_time(p.elapsed, 1)}")
+        if p.out_time and p.elapsed - p.out_time > 2.0:
+            parts.append(f"落后 {format_time(p.elapsed - p.out_time, 1)}")
         if p.speed:
             parts.append(f"速度 {p.speed}")
         if p.fps:
